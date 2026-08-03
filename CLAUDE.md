@@ -114,6 +114,13 @@ the installed version instead.
   itself — `_write_to_stream()` only walks `cells`/`surfaces`/`data_inputs`,
   not `mode` directly. To get a `MODE` card written out, explicitly
   `problem.data_inputs.append(problem.mode)` before writing.
+- MontePy's parser is stricter than MCNP itself in multiple confirmed cases —
+  MCNP infers/normalizes things MontePy requires explicit (e.g. MCNP accepts
+  "lwtr.01" and infers the "t" suffix for MT thermal-scattering cards from
+  context; MontePy's lexer requires "lwtr.01t" literally, confirmed against
+  MCNP6.3.0 output on an unrelated deck). When a MontePy parse fails on a deck
+  that MCNP itself ran successfully, check for MCNP-side leniency before
+  assuming the input is actually wrong.
 - Do not edit this project through the `\\wsl.localhost\` UNC path with
   Windows-side tools (editors, file browsers, Windows-side scripts) — creating a
   file that way has silently deleted a sibling directory, with no error raised.
