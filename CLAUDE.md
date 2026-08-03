@@ -1,26 +1,55 @@
 # OpenMC → MCNP Workflow
 
-## Environment: WSL2 only, one conda env
-This project runs entirely inside WSL2 (Ubuntu), in a single conda env, in the
-Linux filesystem — not split across Windows and WSL2, and not run from
-`/mnt/c/...` (that's the Windows drive mounted into WSL2; it works but is
-noticeably slower for conda/build-heavy work than the native Linux filesystem).
+## Environment: one conda env, platform-specific setup
 
-- `openmc` has no Windows build (not on PyPI at all; conda-forge only ships
-  `linux-64`/`osx` builds) — this is the reason WSL2 is required in the first
-  place, not a preference.
-- Project lives at `~/openmc-mcnp-project` inside WSL2, cloned/copied there
-  directly rather than edited from the Windows-side copy.
-- One conda env (e.g. `openmc-mcnp`) holds `openmc`, `montepy`, `openjdk=8`,
-  and MCNPy/MetaPy (once installed) together. Do not split MCNPy into a
-  Windows-side env and openmc into a WSL2-side env — conda envs don't cross
-  the Windows/WSL2 boundary, so a Python process in one can't import from the
-  other, and Windows (`C:\...`) vs WSL2 (`/mnt/c/...`) paths don't match up
-  cleanly either. Both problems reintroduce exactly what this pipeline is
-  meant to avoid: hand-translating between disconnected environments.
-- Claude Code (and any terminal work on this project) should run with its
-  working directory inside WSL2, not a Windows shell — one shell, one env,
-  one filesystem view.
+`openmc` has no Windows build at all (not on PyPI; conda-forge ships only
+`linux-64`/`osx-64`/`osx-arm64` — no `win-64`). That is the reason this
+project needs a Linux-like environment on Windows specifically, not a
+preference. Everything else (MetaPy/MCNPy wheels, the pipeline scripts) is
+plain Python/JVM and has no platform restriction of its own — verified by
+inspecting the wheels directly (`py3-none-any` tag, contents are `.jar`/`.class`
+files, no `.so`/`.dylib`/`.dll`).
+
+One conda env (e.g. `openmc-mcnp`) holds `openmc`, `montepy`, `openjdk=8`, and
+MCNPy/MetaPy together, on every machine. Never split the pipeline across two
+environments or two filesystems (e.g. openmc in one place, MCNPy in
+another) — conda envs don't cross environment boundaries, so no single Python
+process could import both, and mismatched path conventions between the two
+sides don't line up cleanly either. That reintroduces exactly the
+disconnected-environments problem this pipeline exists to avoid.
+
+### Windows
+
+Requires WSL2 (Ubuntu) — run everything inside it, in the Linux filesystem
+(e.g. `~/openmc-mcnp-project`), not from `/mnt/c/...` (the Windows drive
+mounted into WSL2; works, but noticeably slower for conda/build-heavy work
+than the native Linux filesystem) and not split between a Windows-side copy
+and the WSL2 copy. Claude Code (and any terminal work on this project) should
+run with its working directory inside WSL2, not a Windows shell.
+
+Do not edit this project through the `\\wsl.localhost\` UNC path with
+Windows-side tools (editors, file browsers, Windows-side scripts) — see
+"Known quirks".
+
+### macOS
+
+No WSL2 equivalent needed — run natively. But conda-forge has no `openmc`
+build for `osx-arm64` (Apple Silicon) as of this writing, only `osx-64`
+(confirmed by searching conda-forge directly for both platforms) — Java 8
+itself does have native `osx-arm64` builds, so it's specifically `openmc`
+that's missing, not the whole toolchain. On Apple Silicon, create the env
+under Rosetta 2 with the x86_64 subdir instead of natively:
+
+```bash
+CONDA_SUBDIR=osx-64 conda env create -f environment.yml
+conda activate openmc-mcnp
+conda config --env --set subdir osx-64
+```
+
+The last line pins the env to `osx-64` for future installs into it (e.g. when
+installing MetaPy/MCNPy), so it doesn't drift back to attempting native
+arm64 resolution mid-setup. If a native `osx-arm64` `openmc` build appears on
+conda-forge later, re-check before assuming this workaround is still needed.
 
 ## Purpose
 Draft reactor/pin-cell models in OpenMC (Python), translate them to MCNP input
@@ -59,7 +88,7 @@ say so explicitly and ask before improvising syntax.
 
 ## MCNPy install notes (do this before step 2)
 MCNPy is NOT on PyPI and is not a pure-Python package. It requires:
-- Java 8 (JRE) installed and on PATH — inside the WSL2 conda env, install via
+- Java 8 (JRE) installed and on PATH — inside the project's conda env, install via
   `conda install openjdk=8` rather than a system JDK, so it stays scoped to
   the same env as everything else.
 - `py4j` (Java-Python bridge, pulled in as a normal pip dependency)

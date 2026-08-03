@@ -34,21 +34,31 @@ This applies to edits too. Changing a density inside an existing deck goes throu
 parses the deck, mutates the object, and re-serializes, preserving formatting and comments. Editing
 the text directly reintroduces exactly the risk above.
 
-## Environment: WSL2 only, one conda env
+## Environment: one conda env, platform-specific setup
 
-`openmc` has no Windows build — it is not on PyPI at all, and conda-forge publishes only `linux-64`
-and `osx` builds. That is the reason WSL2 is required, not a preference.
+`openmc` has no Windows build at all — not on PyPI, and conda-forge ships only `linux-64`,
+`osx-64`, and `osx-arm64` (no `win-64`). That's why Windows specifically needs a Linux-like layer;
+it isn't a preference. MetaPy/MCNPy have no such restriction of their own — their wheels are
+`py3-none-any` and contain only `.jar`/`.class` (JVM bytecode), no compiled native code — confirmed
+by unzipping and checking, not by trusting the tag alone.
 
-Everything lives in **one conda env inside WSL2, in the Linux filesystem** (e.g.
-`~/openmc-mcnp-project`, not `/mnt/c/...` — the Windows mount works but is noticeably slower for
-conda/build-heavy work).
+One conda env (e.g. `openmc-mcnp`) holds `openmc`, `montepy`, `openjdk=8`, plus MetaPy and MCNPy —
+on every machine. Never split the pipeline across two environments or filesystems (e.g. openmc in
+one place, MCNPy in another): conda envs don't cross that boundary, so no single Python process
+could import both, and mismatched path conventions between the two sides don't line up either. That
+recreates the disconnected-environments problem this pipeline exists to avoid.
 
-Do not split the pipeline across Windows and WSL2 — e.g. `openmc` in WSL2 and MCNPy on the Windows
-side. Conda envs don't cross that boundary, so no single Python process could import both, and
-`C:\...` vs `/mnt/c/...` paths don't line up. A split setup recreates the disconnected-environments
-problem the pipeline is meant to solve.
+**Windows** needs WSL2 (Ubuntu) — everything runs inside it, in the Linux filesystem (e.g.
+`~/openmc-mcnp-project`), not `/mnt/c/...` (works, but slower for conda/build-heavy work) and not
+split between a Windows-side copy and the WSL2 copy.
 
-One env holds `openmc`, `montepy`, `openjdk=8`, plus MetaPy and MCNPy.
+**macOS** runs natively, no WSL2 equivalent needed — but conda-forge has no `openmc` build for
+`osx-arm64` (Apple Silicon), only `osx-64` (Java 8 itself does have native `osx-arm64` builds, so
+it's specifically `openmc` that's missing). On Apple Silicon, build the env under Rosetta 2 instead:
+`CONDA_SUBDIR=osx-64 conda env create -f environment.yml`, then
+`conda config --env --set subdir osx-64` inside it so later installs (MetaPy/MCNPy) don't drift back
+to native arm64 resolution. Re-check conda-forge before assuming this is still needed — a native
+build may exist by the time this is read.
 
 ## Pipeline order
 
