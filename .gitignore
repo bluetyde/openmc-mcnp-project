@@ -1,0 +1,5 @@
+sweep_decks/
+__pycache__/
+*.pyc
+.claude/settings.local.json
+*.whl

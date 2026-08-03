@@ -1,0 +1,8 @@
+name: openmc-mcnp
+channels:
+  - conda-forge
+dependencies:
+  - openjdk=8
+  - montepy
+  - python=3.11
+  - openmc
