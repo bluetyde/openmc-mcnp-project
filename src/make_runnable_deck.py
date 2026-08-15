@@ -17,6 +17,9 @@ rather than retyping them.
 Run after translate_to_mcnp.py has produced pin_cell.mcnp:
     python src/make_runnable_deck.py
 """
+import os
+import sys
+
 import montepy
 from montepy.data_inputs.data_input import DataInput
 import openmc
@@ -28,10 +31,27 @@ OUT_DECK = "pin_cell_runnable.mcnp"
 # 1.0 is MCNP's own conventional default for this field.
 INITIAL_KEFF_GUESS = 1.0
 
+if not os.path.exists(SOURCE_DECK):
+    sys.exit(
+        f"{SOURCE_DECK} not found — run translate_to_mcnp.py first to "
+        "produce it from geometry.xml/materials.xml."
+    )
+
 settings = openmc.Settings.from_xml("settings.xml")
 particles = settings.particles
 inactive = settings.inactive
 batches = settings.batches
+
+missing = [name for name, value in
+           [("particles", particles), ("inactive", inactive), ("batches", batches)]
+           if value is None]
+if missing:
+    sys.exit(
+        f"settings.xml is missing {', '.join(missing)} — openmc_model.py must "
+        "set these explicitly on the Settings object before exporting, "
+        "otherwise this script would silently write a literal 'None' into "
+        "the KCODE card."
+    )
 
 problem = montepy.read_input(SOURCE_DECK)
 
