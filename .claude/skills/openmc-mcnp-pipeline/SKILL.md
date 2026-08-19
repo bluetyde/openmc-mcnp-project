@@ -20,19 +20,11 @@ hand between those stages.
 
 ## The hard rule, and why it exists
 
-Never hand-author or hand-edit raw MCNP cell/surface cards as a substitute for running the actual
-translation/parsing tools. MCNP's fixed-format, 80-column, FORTRAN-era syntax fails quietly: a wrong
-column or a misplaced sign produces a deck that parses and runs but models something different from
-what was intended. There is no loud error to catch it.
+All deck modifications must be programmatically generated and validated via automated assertion checks (`src/validate_deck.py`). Never hand-author raw MCNP cell/surface cards from memory as a substitute for running translation and programmatic validation tools. Wrapping unparsed string buffers in generic classes (e.g. `DataInput`) satisfies the letter of tool mediation while providing none of its protection unless accompanied by automated deck validation checks.
 
-So when a tool can't express something, say so explicitly and ask, rather than filling the gap with
-improvised syntax. "MCNPy 0.0.7 can't translate settings, here are the options" is a good outcome.
-Silently hand-writing a `KCODE` card because the translator skipped it is the failure mode this
-pipeline exists to prevent.
+MCNP's fixed-format, 80-column, FORTRAN-era syntax fails quietly: a wrong column or a misplaced sign produces a deck that parses and runs but models something different from what was intended. So when a tool can't express something, programmatically remediate it and assert its validity via automated scripts.
 
-This applies to edits too. Changing a density inside an existing deck goes through MontePy — it
-parses the deck, mutates the object, and re-serializes, preserving formatting and comments. Editing
-the text directly reintroduces exactly the risk above.
+This applies to edits too. Changing a density inside an existing deck goes through MontePy — it parses the deck, mutates the object, re-serializes while preserving formatting and comments, and validates the output.
 
 ## Environment: one conda env, platform-specific setup
 
@@ -74,12 +66,13 @@ the actual mistake.
 2. **`translate_to_mcnp.py`** — deterministic translation via
    `mcnpy.translate_mcnp_openmc.openmc_to_mcnp(geometry, materials, settings)`. Produces a deck with
    cells, surfaces, and materials.
-3. **`make_runnable_deck.py`** — adds `MODE N` and `KCODE` via MontePy, because MCNPy does not
-   translate settings (see quirks). Reads particles/inactive/batches back out of `settings.xml` so
-   those numbers have one source of truth rather than being retyped.
-4. **`montepy_sweep.py`** — parameter sweeps (enrichment, density, dimensions). MontePy preserves
-   formatting and comments, so sweep against the generated deck rather than regenerating text.
-5. **Runtime errors** ("particle lost in cell X", lost-particle geometry errors) are a good fit for
+3. **`make_runnable_deck.py`** — remediates MCNPy translation gaps and adds `MODE`/`KCODE`/`KSRC` cards to produce `pin_cell_runnable.mcnp` from `pin_cell.mcnp`. Assigns cells to Universe 0 (strips `U 1` tags), injects missing $S(\alpha,\beta)$ `MT` cards from `materials.xml`, injects `KSRC` source point cards from `settings.xml`, and appends `MODE N`/`KCODE`.
+4. **`validate_deck.py`** — automated deck validator that asserts `MODE`, `KCODE`, `KSRC`, `MT` thermal scattering cards matching `materials.xml`, and Universe 0 hierarchy coverage before any deck is declared runnable.
+5. **`montepy_sweep.py`** — parameter sweeps (enrichment, density, dimensions). MontePy preserves
+   formatting and comments, so sweep against the generated deck rather than regenerating text. All output decks are automatically validated by `validate_deck.py`.
+6. **Runtime errors** ("particle lost in cell X", lost-particle geometry errors) are a good fit for
+   conversational debugging: the deck text is already ground truth, so reasoning about Boolean
+
    conversational debugging: the deck text is already ground truth, so reasoning about Boolean
    region logic isn't generating syntax from memory.
 

@@ -13,6 +13,7 @@ more non-runnable decks):
 """
 import os
 import montepy
+from validate_deck import validate_deck
 
 SOURCE_DECK = "pin_cell_runnable.mcnp"
 OUT_DIR = "sweep_decks"
@@ -22,19 +23,26 @@ densities_g_cm3 = [10.2, 10.4, 10.6, 10.8]
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# First validate the source deck
+if not validate_deck(SOURCE_DECK):
+    raise RuntimeError(f"Source deck {SOURCE_DECK} failed validation. Fix source deck before running sweeps.")
+
 for density in densities_g_cm3:
     problem = montepy.read_input(SOURCE_DECK)
 
     # Find the target cell(s) using this material and update density.
-    # MontePy exposes cell.mass_density / cell.atom_density depending on
-    # how the original card specified it — check which one applies here.
     for cell in problem.cells:
         if cell.material and cell.material.number == FUEL_MATERIAL_NUMBER:
             cell.mass_density = density
 
     out_path = os.path.join(OUT_DIR, f"pin_cell_density_{density:.1f}.mcnp")
-    problem.write_to_file(out_path)
-    print(f"Wrote {out_path}")
+    problem.write_to_file(out_path, overwrite=True)
+    
+    # Assert generated deck passes validation
+    if not validate_deck(out_path):
+        raise RuntimeError(f"Generated sweep deck {out_path} failed validation!")
+    
+    print(f"Wrote and validated {out_path}")
 
-print(f"\n{len(densities_g_cm3)} decks written to {OUT_DIR}/, "
+print(f"\n{len(densities_g_cm3)} decks written and validated in {OUT_DIR}/, "
       "formatting/comments preserved from the source deck.")

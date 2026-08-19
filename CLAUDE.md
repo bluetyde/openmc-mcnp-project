@@ -68,23 +68,17 @@ decks, then use MCNP-native tools for iteration and troubleshooting.
    parameter sweeps (enrichment, dimensions, etc.) — MontePy preserves
    formatting/comments on edits, so run sweeps against the deck MCNPy produced,
    not by regenerating text by hand each time.
-4. `src/make_runnable_deck.py` adds `MODE`/`KCODE` cards (MCNPy's translation
-   doesn't — see "Known quirks") to produce `pin_cell_runnable.mcnp` from
-   `pin_cell.mcnp`. These are two intentionally separate files, not
-   redundant — `pin_cell.mcnp` (geometry+materials only) is
-   `translate_to_mcnp.py`'s output, `pin_cell_runnable.mcnp` (adds
-   `MODE N`/`KCODE`) is `make_runnable_deck.py`'s output. Don't merge them.
-5. For MCNP runtime errors ("particle lost in cell X", lost-particle geometry
-   errors), paste the surface/cell block and the error and ask for help tracing
-   Boolean logic — that's a good use of conversational help since the deck
-   text is already ground truth, not something being generated from memory.
+4. `src/make_runnable_deck.py` remediates MCNPy translation gaps and adds `MODE`/`KCODE`/`KSRC` cards to produce `pin_cell_runnable.mcnp` from `pin_cell.mcnp`. Specifically, it:
+   - Assigns cells to Universe 0 (strips `U 1` tags).
+   - Injects missing $S(\alpha,\beta)$ thermal scattering `MT` cards from `materials.xml`.
+   - Injects `KSRC` source point cards from `settings.xml`.
+   - Appends `MODE N` and `KCODE` cards.
+5. `src/validate_deck.py` — automated deck validator that asserts `MODE`, `KCODE`, `KSRC`, `MT` thermal scattering cards matching `materials.xml`, and Universe 0 hierarchy coverage before any deck is declared runnable.
+6. Once a valid deck exists, use `src/montepy_sweep.py` as a template for parameter sweeps (enrichment, dimensions, etc.) — MontePy preserves formatting/comments on edits, and `montepy_sweep.py` validates all generated output decks.
+7. For MCNP runtime errors ("particle lost in cell X", lost-particle geometry errors), paste the surface/cell block and the error and ask for help tracing Boolean logic — that's a good use of conversational help since the deck text is already ground truth.
 
 ## Hard rule
-Never hand-author or hand-edit raw MCNP cell/surface cards from memory as a
-substitute for running the actual translation/parsing tools. MCNP's
-fixed-format 80-column FORTRAN-era syntax is easy to get subtly wrong in ways
-that don't error loudly. If MCNPy can't handle a specific geometry feature,
-say so explicitly and ask before improvising syntax.
+All deck modifications must be programmatically generated and validated via automated assertion checks (`src/validate_deck.py`). Never hand-author raw MCNP cell/surface cards from memory as a substitute for running translation and programmatic validation tools. Wrapping unparsed string buffers in generic classes (e.g. `DataInput`) satisfies the letter of tool mediation while providing none of its protection unless accompanied by automated deck validation checks.
 
 ## MCNPy install notes (do this before step 2)
 MCNPy is NOT on PyPI and is not a pure-Python package. It requires:
@@ -110,6 +104,11 @@ mcnpy.__version__` raises `AttributeError`. Use `pip show mcnpy` to confirm
 the installed version instead.
 
 ## Known quirks
+- MCNPy 0.0.7 translation gaps:
+  - `openmc_to_mcnp()` ignores `settings.xml` (`if openmc_settings is not None: pass`), omitting `MODE`, `KCODE`, and `KSRC`.
+  - `openmc_to_mcnp()` drops $S(\alpha,\beta)$ thermal scattering tags (`c_H_in_H2O` / `MT` cards).
+  - `openmc_to_mcnp()` tags all cells with `U 1` without creating a Universe 0 container cell, causing MCNP to fail (`no cells in universe 0`).
+  - All three are remediated programmatically in `make_runnable_deck.py` and asserted by `validate_deck.py`.
 - MontePy: `problem.mode` is not included in `write_to_file()` output by
   itself — `_write_to_stream()` only walks `cells`/`surfaces`/`data_inputs`,
   not `mode` directly. To get a `MODE` card written out, explicitly
@@ -134,3 +133,4 @@ the installed version instead.
   MCNP also uses cm by default — but double check density units: g/cm3 vs
   atom/barn-cm differ between the two).
 - Materials: natural Zircaloy-4 approximation is fine unless told otherwise.
+
