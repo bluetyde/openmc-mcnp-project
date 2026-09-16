@@ -67,7 +67,9 @@ the actual mistake.
    `mcnpy.translate_mcnp_openmc.openmc_to_mcnp(geometry, materials, settings)`. Produces a deck with
    cells, surfaces, and materials.
 3. **`make_runnable_deck.py`** — remediates MCNPy translation gaps and adds `MODE`/`KCODE`/`KSRC` cards to produce `pin_cell_runnable.mcnp` from `pin_cell.mcnp`. Assigns cells to Universe 0 (strips `U 1` tags), injects missing $S(\alpha,\beta)$ `MT` cards from `materials.xml`, injects `KSRC` source point cards from `settings.xml`, and appends `MODE N`/`KCODE`.
-4. **`validate_deck.py`** — automated deck validator that asserts `MODE`, `KCODE`, `KSRC`, `MT` thermal scattering cards matching `materials.xml`, and Universe 0 hierarchy coverage before any deck is declared runnable.
+4. **`validate_deck.py`** — automated deck validator: `MODE`, run control matching the OpenMC run mode (`KCODE` + `KSRC`/`SDEF`, or `SDEF` + `NPS` for fixed source), `MT` cards for every S(a,b) material, Universe 0 coverage, a graveyard cell when the geometry has vacuum boundaries, one tally per OpenMC tally score, and sampled-point geometry equivalence (`geometry_check.py`) when the OpenMC model is available.
+
+   **For any model other than the pin cell**, `export_mcnp.py model.xml --name <name>` runs stages 2–4 in one command via `remediate_deck.py` (graveyard cell, SDEF/NPS or KSRC/KCODE, MODE N [P] with photon importances, F4/E4/FM/SD/FMESH tallies) and exits non-zero unless the deck validates. Unsupported features are refused with a reason. `tests/check_export_mcnp.py` proves every validator check still fires — run it after touching export or validation code.
 5. **`montepy_sweep.py`** — parameter sweeps (enrichment, density, dimensions). MontePy preserves
    formatting and comments, so sweep against the generated deck rather than regenerating text. All output decks are automatically validated by `validate_deck.py`.
 6. **Runtime errors** ("particle lost in cell X", lost-particle geometry errors) are a good fit for
@@ -150,6 +152,21 @@ easy to miss unless the tree is re-checked afterward. Edit from inside the WSL s
 via `wsl -d Ubuntu -- <cmd>` from PowerShell. Git Bash is not a safe substitute for the
 latter: it rewrites `/root/...` into `C:/Program Files/Git/root/...`.
 
+**MCNPy `openmc_to_mcnp()` drops vacuum boundaries (0.0.7).** MCNP has no vacuum surface type and no
+graveyard cell is created, so particles leaving the model would be lost. `remediate_deck.py` adds an
+`IMP:N=0` cell that complements every root-universe cell.
+
+**MontePy photon importances (1.1.3).** Setting `cell.importance.photon` on a cell parsed with only
+`IMP:N` writes a duplicate neutron importance and the written deck no longer parses;
+`set_equal_importance()` raises `KeyError: 'photon'`. Delete and re-set instead:
+`v = cell.importance.neutron; del cell.importance.neutron; cell.importance.neutron = v; cell.importance.photon = v`.
+
+**MontePy can't parse `:` in FM cards (1.1.3).** MCNP's `-2:-6` (capture + fission = OpenMC absorption)
+is rejected, so absorption tallies are exported only for materials without actinides.
+
+**`MT` identifiers are library-specific.** Classic names (`lwtr.01t`, `poly.01t`) are the defaults in
+`SAB_MCNP_MAP`; newer MCNP data uses names like `h-h2o.40t`. Check your xsdir; override with `--sab`.
+
 **MCNPy has no `__version__` (0.0.7).** `mcnpy.__version__` raises `AttributeError`. Use
 `pip show mcnpy`.
 
@@ -181,6 +198,13 @@ model-specific and the API details are the part that's easy to get wrong.
 | `references/translate_to_mcnp.py` | 2 — OpenMC → MCNP via MCNPy |
 | `references/make_runnable_deck.py` | 3 — add `MODE`/`KCODE` via MontePy |
 | `references/montepy_sweep.py` | 4 — parameter sweep over a deck |
+| `references/validate_deck.py` | validation for any stage-3 deck |
+| `references/export_mcnp.py` | any model: translate + remediate + validate |
+| `references/remediate_deck.py` | remediation used by both `make_runnable_deck.py` and `export_mcnp.py` |
+| `references/mcnp_cards.py` | SDEF/KCODE/tally cards from OpenMC objects; S(a,b) and FM reaction maps |
+| `references/geometry_check.py` | sampled-point geometry comparison against OpenMC |
+
+`references/` holds copies of `src/`; after changing a script in `src/`, copy it here too.
 
 Verify a signature against the installed version before assuming a call matches — these scripts
 were written against MCNPy 0.0.7 and MontePy 1.1.3, and `inspect.signature()` or reading the
