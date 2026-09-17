@@ -102,6 +102,46 @@ def shielding_model(photon=False, eigen=False, absorption_in_fuel=False):
     return openmc.Model(geometry, openmc.Materials(mats), settings, openmc.Tallies(tallies))
 
 
+def rotated_model():
+    """A box rotated 30 degrees about z (general planes) and a cylinder tilted off-axis (GQ quadric)."""
+    import numpy as np
+    openmc.reset_auto_ids()
+    lead = openmc.Material(name="Lead")
+    lead.set_density("g/cm3", 11.35)
+    lead.add_element("Pb", 1.0)
+    water = openmc.Material(name="Water")
+    water.set_density("g/cm3", 1.0)
+    water.add_element("H", 2.0)
+    water.add_element("O", 1.0)
+    water.add_s_alpha_beta("c_H_in_H2O")
+    R = 50.0
+    planes = [openmc.XPlane(-R, boundary_type="vacuum"), openmc.XPlane(R, boundary_type="vacuum"),
+              openmc.YPlane(-R, boundary_type="vacuum"), openmc.YPlane(R, boundary_type="vacuum"),
+              openmc.ZPlane(-R, boundary_type="vacuum"), openmc.ZPlane(R, boundary_type="vacuum")]
+    world = +planes[0] & -planes[1] & +planes[2] & -planes[3] & +planes[4] & -planes[5]
+    a = np.radians(30)
+    M = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
+    c, h = np.array([-15.0, 0.0, 0.0]), np.array([10.0, 4.0, 6.0])
+    box = None
+    for k in range(3):
+        n = M[:, k]
+        term = +openmc.Plane(a=n[0], b=n[1], c=n[2], d=float(n @ c - h[k])) & -openmc.Plane(a=n[0], b=n[1], c=n[2], d=float(n @ c + h[k]))
+        box = term if box is None else box & term
+    u = np.array([0.3, -0.5, 0.8]) / np.linalg.norm([0.3, -0.5, 0.8])
+    q, r, hh = np.array([20.0, 5.0, 0.0]), 5.0, 12.0
+    Pm = np.eye(3) - np.outer(u, u)
+    lin = -2 * Pm @ q
+    quad = openmc.Quadric(a=Pm[0, 0], b=Pm[1, 1], c=Pm[2, 2], d=2 * Pm[0, 1], e=2 * Pm[1, 2], f=2 * Pm[0, 2],
+                          g=lin[0], h=lin[1], j=lin[2], k=float(q @ Pm @ q - r * r))
+    cyl = -quad & +openmc.Plane(a=u[0], b=u[1], c=u[2], d=float(u @ q - hh)) & -openmc.Plane(a=u[0], b=u[1], c=u[2], d=float(u @ q + hh))
+    cells = [openmc.Cell(name="Box", fill=lead, region=box & world),
+             openmc.Cell(name="Cylinder", fill=water, region=cyl & world & ~box),
+             openmc.Cell(name="World", region=world & ~box & ~cyl)]
+    settings = openmc.Settings(run_mode="fixed source", particles=1000, batches=5, seed=1)
+    settings.source = openmc.IndependentSource(space=openmc.stats.Point((0, 0, 0)))
+    return openmc.Model(openmc.Geometry(cells), openmc.Materials([lead, water]), settings)
+
+
 def export_model(model, work, name):
     d = os.path.join(work, name)
     os.makedirs(d)
@@ -131,6 +171,23 @@ def main():
             reports[name] = r
             check(r["ok"], f"{name}: exported deck validates")
             check("geometry matches OpenMC" in r["validation"], f"{name}: geometry check ran and matched")
+
+        r = export_model(rotated_model(), work, "rotated")
+        check(r["ok"], "rotated box + cylinder (general planes, GQ): exported deck validates")
+        check("geometry matches OpenMC" in r["validation"], "rotated: geometry check ran and matched")
+        rot_text = open(r["runnable"]).read()
+        check(re.search(r"^\d+ GQ ", rot_text, re.M) is not None, "rotated: cylinder written as a GQ card")
+        rot_model = load_model(os.path.join(work, "rotated", "model.xml"))
+        lines = rot_text.split("\n")
+        gi = next(i for i, l in enumerate(lines) if re.match(r"^\d+ GQ ", l))
+        gj = gi + 1
+        while gj < len(lines) and lines[gj].startswith("     "):
+            gj += 1
+        head, last = lines[gj - 1].rstrip().rsplit(" ", 1)
+        lines[gj - 1] = head + " " + repr(float(last) * 0.8)  # scale the GQ constant K
+        broken = "\n".join(lines)
+        ok, out = validate_text(broken, rot_model, work)
+        check(broken != rot_text and not ok and "Geometry:" in out, "[rotated: GQ constant changed] rejected by the geometry check")
 
         photon_text = open(reports["photon"]["runnable"]).read()
         check("MODE N P" in photon_text and re.search(r"IMP:n,p=", photon_text, re.I) is not None,

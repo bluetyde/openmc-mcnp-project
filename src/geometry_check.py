@@ -11,7 +11,7 @@ OpenMC IDs), and points outside the OpenMC model must land in a cell with IMP:N=
 Cell materials and densities are compared too.
 
 Supported MCNP surfaces: P (4-constant form), PX/PY/PZ, SO, S, SX/SY/SZ, CX/CY/CZ,
-C/X, C/Y, C/Z. Decks with other surface types, transformations, universes/fills or
+C/X, C/Y, C/Z, GQ (rotated cylinders and other general quadrics). Decks with other surface types, transformations, universes/fills or
 lattices are reported as not checkable rather than silently passed.
 """
 import math
@@ -60,6 +60,18 @@ def _surface_fn(s):
         else:
             ca, cb, r = 0.0, 0.0, c[0]
         return lambda P: ((P[:, a] - ca) ** 2 + (P[:, b] - cb) ** 2 - r * r, 2 * r)
+    if t == "GQ" and len(c) == 10:
+        # MCNP order: A x^2 + B y^2 + C z^2 + D xy + E yz + F zx + G x + H y + J z + K
+        A, B, C, D, E, F, G, H, J, K = c
+
+        def gq(P):
+            x, y, z = P[:, 0], P[:, 1], P[:, 2]
+            v = A * x * x + B * y * y + C * z * z + D * x * y + E * y * z + F * z * x + G * x + H * y + J * z + K
+            gx = 2 * A * x + D * y + F * z + G
+            gy = 2 * B * y + D * x + E * z + H
+            gz = 2 * C * z + E * y + F * x + J
+            return v, np.sqrt(gx * gx + gy * gy + gz * gz)  # |v| / |grad| ~ distance to the surface
+        return gq
     raise NotCheckable(f"surface {s.number} type {t} isn't supported by the geometry check")
 
 
@@ -142,7 +154,7 @@ def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345)
     for num, fn in surf_fns.items():
         v, scale = fn(P)
         surf_vals[num] = v
-        near |= np.abs(v) / max(scale, 1e-12) < SURFACE_TOL
+        near |= np.abs(v) / np.maximum(scale, 1e-12) < SURFACE_TOL
     keep = ~near
     P = P[keep]
     surf_vals = {k: v[keep] for k, v in surf_vals.items()}

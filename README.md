@@ -39,6 +39,7 @@ python tests/check_export_mcnp.py                                    # self-test
 Writes `<name>.mcnp` (MCNPy output) and `<name>_runnable.mcnp`, and exits non-zero unless the
 runnable deck validates. Supported: fixed-source (single point/box/sphere/cylinder source; line,
 Watt, Maxwell or uniform energies; isotropic or beam) and eigenvalue runs; vacuum and reflective
-boundaries; photon transport; cell tallies (flux and reaction rates) and regular-mesh flux tallies.
+boundaries; photon transport; cell tallies (flux and reaction rates) and regular-mesh flux tallies; rotated boxes
+and cylinders (general P and GQ surfaces).
 Anything else is refused with a reason instead of being exported approximately.
 
