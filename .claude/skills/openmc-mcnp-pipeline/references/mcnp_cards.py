@@ -139,6 +139,16 @@ def _energy(dist, dists):
         return dists.add(None, f"-2 {num(dist.theta / 1e6)}")
     if isinstance(dist, openmc.stats.Uniform):
         return dists.add(f"H {num(dist.a / 1e6)} {num(dist.b / 1e6)}", "0 1")
+    if isinstance(dist, openmc.stats.Tabular):
+        if dist.interpolation != "histogram":
+            raise UnsupportedFeature(f"Tabular energy distribution with interpolation '{dist.interpolation}' isn't supported (only 'histogram').")
+        edges = [num(e / 1e6) for e in dist.x]
+        probs = [num(p) for p in dist.p]
+        if len(probs) == len(edges) - 1:
+            sp_vals = ["0"] + probs
+        else:
+            sp_vals = probs
+        return dists.add("H " + " ".join(edges), "D " + " ".join(sp_vals))
     raise UnsupportedFeature(f"Source energy distribution {type(dist).__name__} isn't supported.")
 
 

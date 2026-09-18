@@ -196,6 +196,17 @@ def main():
         check("KCODE 1000 1.0 2 5" in eigen_text and "KSRC 0.0 0.0 0.0" in eigen_text and "SDEF" not in eigen_text,
               "eigen: KCODE/KSRC from settings, no SDEF")
 
+        tab_m = shielding_model()
+        tab_m.settings.source = [openmc.IndependentSource(
+            space=openmc.stats.Point((0, 0, 0)),
+            energy=openmc.stats.Tabular([0.0, 1e6, 2e6, 5e6], [0.2, 0.5, 0.3], interpolation="histogram")
+        )]
+        tab_rep = export_model(tab_m, work, "tabular")
+        check(tab_rep["ok"], "tabular source: exported deck validates")
+        tab_text = open(tab_rep["runnable"]).read()
+        check("SI1 H 0.0 1.0 2.0 5.0" in tab_text and "SP1 D 0 0.2 0.5 0.3" in tab_text,
+              "tabular source: SI H and SP D cards written correctly")
+
         print("2. Each validator check fires on a broken deck")
         base_path = reports["fixed"]["runnable"]
         base = open(base_path).read()
