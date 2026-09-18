@@ -229,7 +229,49 @@ def _can_fission(material):
     return any(zam(n.name)[0] >= 90 for n in material.nuclides)
 
 
-def tally_cards(tallies, geometry):
+
+def _resolve_energy_fn(eff, tally_name, materials):
+    """Resolve an EnergyFunctionFilter into (mat_id, mt, scale) for MCNP FM card."""
+    is_micro = bool(len(eff.y) and eff.y[0] > 10.0)
+    scale = "1" if is_micro else "-1"
+
+    tname = (tally_name or "").lower()
+    target_nuc = None
+    mt = "103"
+    if "he-3" in tname or "he3" in tname:
+        target_nuc = "he3"
+        mt = "103"
+    elif "b-10" in tname or "b10" in tname:
+        target_nuc = "b10"
+        mt = "107"
+    elif "fission" in tname:
+        mt = "-6"
+    elif "absorption" in tname:
+        mt = "-2"
+    elif "capture" in tname or "gamma" in tname:
+        mt = "102"
+
+    mat_id = None
+    if materials:
+        if target_nuc:
+            for m in materials:
+                if any(target_nuc in n.name.lower() for n in m.nuclides):
+                    mat_id = m.id
+                    break
+        if mat_id is None:
+            for m in materials:
+                if any("he3" in n.name.lower() for n in m.nuclides):
+                    mat_id = m.id
+                    mt = "103"
+                    break
+                elif any("b10" in n.name.lower() for n in m.nuclides):
+                    mat_id = m.id
+                    mt = "107"
+                    break
+
+    return mat_id, mt, scale
+
+def tally_cards(tallies, geometry, materials=None):
     """F4/E4/FM/SD for cell tallies and FMESH for regular-mesh tallies.
 
     Returns (cards, notes). Cell tallies get SD=1 so MCNP reports volume-integrated
@@ -242,7 +284,7 @@ def tally_cards(tallies, geometry):
     for t in tallies or []:
         if t.nuclides and list(t.nuclides) != ["total"]:
             raise UnsupportedFeature(f"Tally '{t.name}': per-nuclide tallies aren't supported.")
-        cell_f = energy_f = mesh_f = None
+        cell_f = energy_f = mesh_f = energy_fn_f = None
         for f in t.filters:
             if isinstance(f, openmc.CellFilter):
                 cell_f = f
@@ -252,6 +294,8 @@ def tally_cards(tallies, geometry):
                 mesh_f = f
             elif isinstance(f, openmc.ParticleFilter) and list(f.bins) == ["neutron"]:
                 pass
+            elif isinstance(f, openmc.EnergyFunctionFilter):
+                energy_fn_f = f
             else:
                 raise UnsupportedFeature(f"Tally '{t.name}': {type(f).__name__} isn't supported.")
         if bool(cell_f) == bool(mesh_f):
@@ -291,6 +335,11 @@ def tally_cards(tallies, geometry):
                             f"absorption (-2) excludes fission and this material has actinides; tally 'fission' and "
                             f"'(n,gamma)' separately instead.")
                     cards.append(f"FM{n} (-1 {mat_id} {SCORE_FM[score]})")
+                elif energy_fn_f is not None:
+                    resp_mat_id, mt, scale = _resolve_energy_fn(energy_fn_f, t.name, materials)
+                    if resp_mat_id and mt:
+                        cards.append(f"FM{n} ({scale} {resp_mat_id} {mt})")
+                        notes.append(f"Tally '{t.name}' (F{n}): EnergyFunctionFilter translated to MCNP multiplier FM{n} ({scale} {resp_mat_id} {mt}).")
                 if e_card:
                     cards.append(f"E{n} {e_card}")
                 cards.append(f"SD{n} " + " ".join("1" for _ in ids))
@@ -305,6 +354,11 @@ def tally_cards(tallies, geometry):
                 card = (f"FMESH{n}:N GEOM=XYZ ORIGIN={num(lo[0])} {num(lo[1])} {num(lo[2])}"
                         f"\n     IMESH={num(hi[0])} IINTS={int(nx)} JMESH={num(hi[1])} JINTS={int(ny)}"
                         f"\n     KMESH={num(hi[2])} KINTS={int(nz)}")
+                if energy_fn_f is not None:
+                    resp_mat_id, mt, scale = _resolve_energy_fn(energy_fn_f, t.name, materials)
+                    if resp_mat_id and mt:
+                        card += f"\n     FM={scale} {resp_mat_id} {mt}"
+                        notes.append(f"Tally '{t.name}' (FMESH{n}): EnergyFunctionFilter translated to FMESH multiplier FM={scale} {resp_mat_id} {mt}.")
                 if e_card:
                     card += f"\n     EMESH={e_card}"
                 cards.append(card)

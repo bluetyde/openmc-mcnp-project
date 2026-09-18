@@ -108,7 +108,7 @@ def remediate(source_deck, model, out_deck, sab_map=None):
     else:
         cards.append(mcnp_cards.mode_card(settings))
         cards += mcnp_cards.fixed_source_cards(settings)
-    t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry)
+    t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry, model.materials)
     cards += t_cards
     report["notes"] += t_notes
     report["added"] += [c.split("\n")[0] for c in cards]
