@@ -92,7 +92,8 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
         raise ValueError(f"{source_deck} doesn't have cell, surface and data blocks separated by blank lines.")
 
     # 1b. lattices: MCNPy's LAT/FILL cards are rewritten from the OpenMC lattices (src/lattice_cards.py)
-    report["notes"] += lattice_cards.rewrite(blocks, model)
+    lattice_maps = {}  # lattice id -> MCNP LAT cell and index map, for tally chains
+    report["notes"] += lattice_cards.rewrite(blocks, model, lattice_maps)
 
     # 2. graveyard cell for vacuum boundaries (inserted at the end of the cell block)
     vac = vacuum_surfaces(geometry)
@@ -123,11 +124,13 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
     else:
         cards.append(mcnp_cards.mode_card(settings))
         cards += mcnp_cards.fixed_source_cards(settings)
-    t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry, model.materials, detector_responses)
-    cards += t_cards
+    t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry, model.materials, detector_responses,
+                                              lattice_maps)
     report["notes"] += t_notes
-    report["added"] += [c.split("\n")[0] for c in cards]
+    report["added"] += [c.split("\n")[0] for c in cards + t_cards]
 
+    # tallies go on after MontePy has written the deck: MontePy 1.1.3 can't parse tally chains
+    # (1 < 7[0 0 0] < 3), and it has nothing to change in the tally cards
     augmented = "\n\n".join(blocks).strip() + "\n" + "\n".join(cards) + "\n"
 
     fd, tmp = tempfile.mkstemp(suffix=".mcnp")
@@ -159,6 +162,11 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
             report["added"].append("IMP:P on every cell (same as IMP:N)")
 
         problem.write_to_file(out_deck, overwrite=True)
+        if t_cards:
+            with open(out_deck) as f:
+                text = f.read().rstrip("\n")
+            with open(out_deck, "w") as f:
+                f.write(text + "\n" + "\n".join(t_cards) + "\n")
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)

@@ -182,6 +182,11 @@ def mcnpy_view(model):
                 c.fill = lat
 
 
+def _pad(idx):
+    """An OpenMC lattice index as a 3-tuple (2D lattices have no z index)."""
+    return tuple(int(v) for v in idx) + (0,) * (3 - len(idx))
+
+
 def _filled_bounds(lat, filled):
     for c in filled:
         if c.translation is not None or c.rotation is not None:
@@ -222,7 +227,8 @@ def _rect_layout(lat, filled):
     ids = [uni(i, j, k) for k in range(lo[2], hi[2] + 1) for j in range(lo[1], hi[1] + 1) for i in range(lo[0], hi[0] + 1)]
     single = lo == [0, 0, 0] and hi == [nx - 1, ny - 1, nz - 1] and len(set(ids)) == 1
     origin = [ll[k] + pitch[k] / 2 for k in range(len(pitch))] + ([0.0] if len(pitch) == 2 else [])
-    return 1, planes, lo, hi, ids, single, origin, f"pitch {pitch}"
+    index = {(i, j, k): (i, j, k) for k in range(nz) for j in range(ny) for i in range(nx)}  # OpenMC's (x, y, z) = MCNP's
+    return 1, planes, lo, hi, ids, single, origin, f"pitch {pitch}", index
 
 
 def _hex_layout(lat, filled):
@@ -260,7 +266,7 @@ def _hex_layout(lat, filled):
             klo = min(klo, math.floor((blo[2] - (z0 - pz / 2)) / pz + 1e-9))
             khi = max(khi, math.ceil((bhi[2] - (z0 - pz / 2)) / pz - 1e-9) - 1)
     lo, hi = [-M, -M, klo], [M, M, khi]
-    ids = []
+    ids, index = [], {}
     for k in range(klo, khi + 1):
         for j in range(-M, M + 1):
             for i in range(-M, M + 1):
@@ -268,16 +274,19 @@ def _hex_layout(lat, filled):
                 idx, _ = lat.find_element(pt)
                 if lat.is_valid_index(idx):
                     ids.append(lat.get_universe(idx).id)
+                    index[_pad(idx)] = (i, j, k)
                 elif lat.outer is not None:
                     ids.append(lat.outer.id)
                 else:
                     raise UnsupportedFeature(f"Hex lattice {lat.id} doesn't cover its cell and has no outer universe.")
-    return 2, planes, lo, hi, ids, len(set(ids)) == 1, [cx, cy, z0], f"pitch {list(lat.pitch)}, {lat.orientation} orientation"
+    return (2, planes, lo, hi, ids, len(set(ids)) == 1, [cx, cy, z0],
+            f"pitch {list(lat.pitch)}, {lat.orientation} orientation", index)
 
 
-def rewrite(blocks, model):
+def rewrite(blocks, model, index_maps=None):
     """Rewrite MCNPy's lattice cards in a deck split into blocks [cells, surfaces, data...], in place.
-    Returns notes."""
+    Returns notes. If `index_maps` is a dict, it gets {lattice id: {"cell": MCNP LAT cell number,
+    "index": {OpenMC element index (x, y, z): MCNP [i, j, k]}}} for tally chains (mcnp_cards.tally_cards)."""
     geometry = model.geometry
     lattices = list(geometry.get_all_lattices().values())  # get_all_universes() leaves lattices out
     if not lattices:
@@ -302,9 +311,11 @@ def rewrite(blocks, model):
         if not filled:
             raise UnsupportedFeature(f"Lattice {L} isn't used by any cell.")
         if isinstance(lat, openmc.RectLattice):
-            lat_type, planes, lo, hi, ids, single, origin, desc = _rect_layout(lat, filled)
+            lat_type, planes, lo, hi, ids, single, origin, desc, index = _rect_layout(lat, filled)
         else:
-            lat_type, planes, lo, hi, ids, single, origin, desc = _hex_layout(lat, filled)
+            lat_type, planes, lo, hi, ids, single, origin, desc, index = _hex_layout(lat, filled)
+        if index_maps is not None:
+            index_maps[L] = {"cell": num, "index": index}
 
         region = []
         for kind, params, sense in planes:

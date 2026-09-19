@@ -10,6 +10,8 @@ Self-test for src/export_mcnp.py and src/validate_deck.py.
 4. Exports rectangular lattices as LAT=1 / FILL cards and breaks them (surface order, FILL origin, FILL
    array order, a TRCL) to show the geometry check notices each mistake.
 5. Does the same for hexagonal lattices (LAT=2), in both orientations, with face-order mistakes.
+6. Exports tallies on cells inside lattice elements (CellInstanceFilter) as MCNP chains (c < L[i j k] < c0),
+   rectangular and hexagonal, and breaks them (wrong element index, wrong cell, a missing bin).
 
 Run from the project root, in the openmc-mcnp env:
     python tests/check_export_mcnp.py
@@ -248,6 +250,21 @@ def hex_lattice_model(orientation="y", two_levels=True):
     return openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
 
 
+def lattice_tally_model(kind):
+    """lattice_3d_model() or hex_lattice_model() with a flux + absorption tally on the steel rod in three lattice
+    elements (a CellInstanceFilter), picked from the first, middle and last of the rod's instances."""
+    model = lattice_3d_model() if kind == "rect" else hex_lattice_model("y", True)
+    g = model.geometry
+    rod = next(c for c in g.get_all_cells().values() if c.name in ("Rod", "Steel rod"))
+    g.determine_paths()
+    n = rod.num_instances
+    t = openmc.Tally(name=f"{kind} rods")
+    t.filters = [openmc.CellInstanceFilter([(rod, 0), (rod, n // 2), (rod, n - 1)])]
+    t.scores = ["flux", "absorption"]
+    model.tallies = openmc.Tallies([t])
+    return model
+
+
 def export_model(model, work, name):
     d = os.path.join(work, name)
     os.makedirs(d)
@@ -459,6 +476,42 @@ def main():
         moved = baseh.replace(mo.group(0), f"FILL={mo.group(1)} ({mo.group(2)} {float(mo.group(3)) + 0.7} {mo.group(4)})", 1)
         ok, out = validate_text(moved, modelh, work)
         check(not ok and "Geometry:" in out, "[hex: FILL origin shifted 0.7 cm in y] rejected by the geometry check")
+
+        print("6. Tallies on cells inside lattice elements as MCNP chains")
+        tal = {}
+        for kind in ("rect", "hex"):
+            r = export_model(lattice_tally_model(kind), work, f"tally_{kind}")
+            text = open(r["runnable"]).read()
+            tal[kind] = (text, load_model(os.path.join(work, f"tally_{kind}", "model.xml")))
+            f4 = re.search(r"^F4:N (.*)$", text, re.M)
+            check(r["ok"], f"{kind}: deck with lattice tally chains validates")
+            check(f4 is not None and len(re.findall(r"\(\d+ < \d+\[-?\d+ -?\d+ -?\d+\] < \d+\)", f4.group(1))) == 3,
+                  f"{kind}: F4 has three chains (rod < LAT cell[i j k] < filled cell)")
+            check(re.search(r"^SD4 1 1 1$", text, re.M) is not None and re.search(r"^FM14 \(-1 \d+ -2\)", text, re.M),
+                  f"{kind}: SD with one 1 per bin, absorption FM from the rod's material")
+            check("3 of 3 lattice tally bins hold the same points" in r["validation"],
+                  f"{kind}: every chain holds the same points as its OpenMC cell instance")
+
+        def tally_mutate(kind, desc, change, expect):
+            base, model = tal[kind]
+            text = re.sub(r"^F4:N .*$", lambda m: change(m.group(0)), base, count=1, flags=re.M)
+            ok, out = validate_text(text, model, work)
+            check(text != base and not ok and re.search(expect, out) is not None, f"[{kind}: {desc}] rejected with /{expect}/")
+            if ok or re.search(expect, out) is None:
+                print("      validator said:\n" + "\n".join("      " + l for l in out.splitlines()[-6:]))
+
+        def shift_first_index(card):  # element [i j k] -> [i+1 j k] in the first chain: a neighbour, often the same universe
+            m = re.search(r"\[(-?\d+) (-?\d+) (-?\d+)\]", card)
+            return card[:m.start()] + f"[{int(m.group(1)) + 1} {m.group(2)} {m.group(3)}]" + card[m.end():]
+
+        for kind in ("rect", "hex"):
+            tally_mutate(kind, "first bin's element index moved by one", shift_first_index, r"bin for cell \d+ instance \d+: point")
+        rod_water = next(c.id for c in tal["rect"][1].geometry.get_all_cells().values() if c.name == "Rod water")
+        tally_mutate("rect", "first bin ends in the rod's water, not the rod",
+                     lambda card: re.sub(r"\((\d+) <", f"({rod_water} <", card, count=1), r"ends in MCNP cell")
+        tally_mutate("rect", "last bin dropped", lambda card: card[:card.rindex("(")].rstrip(), r"has 2 bins but")
+        tally_mutate("rect", "lattice index on a cell that isn't a lattice",
+                     lambda card: re.sub(r"< (\d+)\)", r"< \1[0 0 0])", card, count=1), r"aren't lattice cells")
 
         print("3. Unsupported features are refused")
         try:

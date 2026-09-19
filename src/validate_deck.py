@@ -23,7 +23,9 @@ in the current folder when they exist.
 """
 import argparse
 import os
+import re
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 
 import montepy
@@ -44,6 +46,57 @@ def _data_lines(problem):
     return lines
 
 
+def _read_deck(deck_path):
+    """montepy.read_input, with each tally chain (1 < 7[0 0 0] < 3) replaced by its bottom cell first:
+    MontePy 1.1.3 can't parse chains. The tally checks read the chains from the deck's text."""
+    text = open(deck_path).read()
+    plain = re.sub(r"\(\s*(\d+)[^()]*<[^()]*\)", r"\1", text)
+    if plain == text:
+        return montepy.read_input(deck_path)
+    fd, tmp = tempfile.mkstemp(suffix=".mcnp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(plain)
+        return montepy.read_input(tmp)
+    finally:
+        os.remove(tmp)
+
+
+def _tally_card_texts(raw_text):
+    """[(name, bins text)] for every F and FMESH card, continuation lines (leading spaces) joined."""
+    cards, cur = [], None
+    for l in raw_text.splitlines():
+        if l.startswith(" ") and l.strip():
+            if cur is not None:
+                cur[1].append(l.strip())
+            continue
+        cur = None
+        w = l.split()
+        if w and (w[0].startswith("FMESH") or (w[0][:1] == "F" and w[0][1:2].isdigit())):
+            cur = (w[0], [" ".join(w[1:])])
+            cards.append(cur)
+    return [(name, " ".join(parts)) for name, parts in cards]
+
+
+def _tally_bins(text):
+    """Bins of an F card: a plain cell number, or a chain (c < L[i j k] < ... < c0) (manual p. 452-455) as
+    [(cell, (i, j, k) or None)], top level first. Words that aren't cells (T, ...) are skipped."""
+    bins = []
+    for m in re.finditer(r"\(([^)]*)\)|(\S+)", text):
+        if m.group(2) is not None:
+            if m.group(2).isdigit():
+                bins.append([(int(m.group(2)), None)])
+            continue
+        levels = []
+        for part in m.group(1).split("<"):
+            lm = re.fullmatch(r"\s*(\d+)\s*(?:\[\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*\])?\s*", part)
+            if lm is None:
+                raise ValueError(f"can't read tally chain level '{part.strip()}'")
+            levels.append((int(lm.group(1)), tuple(int(v) for v in lm.group(2, 3, 4)) if lm.group(2) else None))
+        bins.append(levels[::-1])
+    return bins
+
+
 def validate_deck(deck_path, materials_path="materials.xml", model=None, geometry_samples=0):
     """Validate a deck. `model` is an openmc.Model (or None to use XML files in the cwd when present)."""
     print(f"--- Validating MCNP Deck: {deck_path} ---")
@@ -53,7 +106,7 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
         return False
 
     try:
-        problem = montepy.read_input(deck_path)
+        problem = _read_deck(deck_path)
     except Exception as e:
         print(f"FAIL: MontePy failed to parse deck: {e}")
         return False
@@ -152,31 +205,69 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
         errors.append(f"Orphaned non-zero Universes detected {non_zero - filled}: no FILL (or lattice FILL array) uses them.")
 
     if model is not None:
+        import openmc
+
         # 5. vacuum boundary -> graveyard
         vac = [s.id for s in model.geometry.get_all_surfaces().values() if s.boundary_type == "vacuum"]
         if vac and not any(c.importance.neutron == 0 for c in problem.cells):
             errors.append(f"The OpenMC geometry has vacuum boundaries (surfaces {vac}) but no MCNP cell has IMP:N=0; "
                           f"particles leaving the model would be lost.")
 
-        # 6. tallies
+        # 6. tallies; chain bins (cells inside lattices) are checked against OpenMC's instances in step 7
         expected = sum(len(t.scores) for t in (model.tallies or []))
-        found_tallies = [l for l in raw_text.splitlines()
-                         if l.strip() and not l.startswith(" ")
-                         and (l.split()[0].startswith("FMESH") or (l.split()[0][:1] == "F" and l.split()[0][1:2].isdigit()))]
+        found_tallies = _tally_card_texts(raw_text)
         if len(found_tallies) != expected:
             errors.append(f"Expected {expected} tallies (one per OpenMC tally score) but found {len(found_tallies)}.")
-        cell_numbers = {c.number for c in problem.cells}
-        for l in found_tallies:
-            head, *rest = l.split()
-            if head.startswith("F") and not head.startswith("FMESH") and ":" in head:
-                bad = [w for w in rest if w.isdigit() and int(w) not in cell_numbers]
+        cells_by_num = {c.number: c for c in problem.cells}
+        card_bins = []
+        for head, rest in found_tallies:
+            bins = None
+            if not head.startswith("FMESH") and ":" in head:
+                try:
+                    bins = _tally_bins(rest)
+                except ValueError as e:
+                    errors.append(f"{head}: {e}.")
+                    bins = []
+                bad = [str(c) for c in sorted({c for b in bins for c, _ in b if c not in cells_by_num})]
                 if bad:
                     errors.append(f"{head} refers to cells {bad} that aren't in the deck.")
+                not_lat = sorted({c for b in bins for c, i in b if i is not None and c in cells_by_num
+                                  and getattr(cells_by_num[c], "lattice_type", None) is None})
+                if not_lat:
+                    errors.append(f"{head} gives lattice indices for cells {not_lat}, which aren't lattice cells.")
+            card_bins.append((head, bins))
+        chains = []
+        if len(found_tallies) == expected:
+            cards_iter = iter(card_bins)
+            all_cells, pathed = model.geometry.get_all_cells(), False
+            for t in model.tallies or []:
+                inst = next((f for f in t.filters if isinstance(f, openmc.CellInstanceFilter)), None)
+                for _score in t.scores:
+                    head, bins = next(cards_iter)
+                    if inst is None or bins is None:
+                        continue
+                    if len(bins) != len(inst.bins):
+                        errors.append(f"{head} has {len(bins)} bins but OpenMC tally '{t.name}' has {len(inst.bins)} cell instances.")
+                        continue
+                    if not pathed:
+                        model.geometry.determine_paths()
+                        pathed = True
+                    for (cid, i), b in zip(inst.bins, bins):
+                        cid, i = int(cid), int(i)
+                        if b[-1][0] != cid:
+                            errors.append(f"{head}: the bin for OpenMC cell {cid} (instance {i}) ends in MCNP cell {b[-1][0]}.")
+                        elif cid in all_cells and 0 <= i < len(all_cells[cid].paths):
+                            chains.append((f"{head} bin for cell {cid} instance {i}", tuple(b), all_cells[cid].paths[i]))
 
         # 7. geometry equivalence
         if geometry_samples:
             from geometry_check import check_geometry
-            g = check_geometry(problem, model.geometry, n_samples=geometry_samples)
+            seen, uniq = set(), []
+            for label, ch, op in chains:  # one entry per bin, even when several scores repeat the card
+                if (ch, op) not in seen:
+                    seen.add((ch, op))
+                    uniq.append((label, ch, op))
+            g = check_geometry(problem, model.geometry, n_samples=geometry_samples, chains=uniq or None)
             if g["reason"]:
                 errors.append(f"Geometry check could not run: {g['reason']}.")
             elif not g["ok"]:
@@ -184,6 +275,13 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
             else:
                 passed.append(f"geometry matches OpenMC at {g['checked_points']} sampled points "
                               f"({g['skipped_near_surface']} on-surface points skipped), materials and densities match")
+                if uniq:
+                    passed.append(f"{len(uniq) - len(g['unhit_chains'])} of {len(uniq)} lattice tally bins hold the same "
+                                  f"points as their OpenMC cell instances")
+                for label in g["unhit_chains"]:
+                    print(f"WARNING: {label}: no sampled point fell in it, so it wasn't compared with OpenMC.")
+        elif chains:
+            print("WARNING: lattice tally bins weren't compared with OpenMC (run with geometry samples to check them).")
 
     if errors:
         print(f"Validation FAILED with {len(errors)} error(s):")

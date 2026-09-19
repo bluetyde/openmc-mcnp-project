@@ -12,6 +12,12 @@ Each point must be inside exactly one cell at every level (0 = undefined space -
 (MCNPy keeps OpenMC IDs), and points outside the OpenMC model must land in a cell with IMP:N=0.
 Cell materials and densities are compared too.
 
+Tally chains: given `chains` [(label, MCNP path, OpenMC instance path)], each point's MCNP path (the cells it
+passes through from universe 0 down, with lattice indices) and OpenMC path (u4->c4->l2(1,0,0)->u1->c1, as
+Geometry.determine_paths writes it) are recorded, and a bin's MCNP path must hold exactly the points its
+OpenMC instance holds. This follows the lattice cards as MCNP reads them, so a wrong [i j k] in a tally bin
+is caught even when the element it names holds the same universe.
+
 Lattice rules follow the MCNP 6.3.0 manual (LA-UR-22-30006 Rev. 1, PDF pages): beyond the 1st surface listed
 on a LAT=1 cell is element [1,0,0], beyond the 2nd [-1,0,0], and so on for j and k (p. 290); a FILL array
 lists universes with i varying fastest and elements outside its ranges don't exist (p. 291-292); a value equal
@@ -252,8 +258,10 @@ class _Deck:
         self.elements = {c.number: _Element(c, self.surfaces_by_num)
                          for c in problem.cells if getattr(c, "lattice_type", None) is not None}
 
-    def locate(self, P, universe=0, depth=0):
-        """MCNP leaf cell number for each point of P (in `universe`'s coordinates), or LOST / OVERLAP / NEAR."""
+    def locate(self, P, universe=0, depth=0, paths=None):
+        """MCNP leaf cell number for each point of P (in `universe`'s coordinates), or LOST / OVERLAP / NEAR.
+        If `paths` (one list per point) is given, each point's (cell number, lattice index or None) levels are
+        appended to it, top level first."""
         out = np.full(len(P), LOST, dtype=np.int64)
         if len(P) == 0:
             return out
@@ -264,7 +272,7 @@ class _Deck:
         if lat:  # a lattice is the only cell of its universe and repeats forever (p. 289): index every point
             if len(cells) != 1:
                 raise NotCheckable(f"universe {universe} has a lattice cell and other cells")
-            return self._lattice(lat[0], P, depth)
+            return self._lattice(lat[0], P, depth, paths)
         cache, near = {}, np.zeros(len(P), dtype=bool)
 
         def sv(num):
@@ -285,19 +293,28 @@ class _Deck:
                 continue
             f = c.fill
             fu = getattr(f, "universe", None) if f is not None else None
+            sub = None
+            if paths is not None and c.number not in self.elements:
+                for p in sel:
+                    paths[p].append((c.number, None))
+            if paths is not None:
+                sub = [paths[p] for p in sel]
             if c.number in self.elements:
-                out[sel] = self._lattice(c, P[sel], depth)
+                out[sel] = self._lattice(c, P[sel], depth, sub)
             elif fu is not None:
                 tr = getattr(f, "transform", None)
                 shift = np.asarray(tr.displacement_vector, dtype=float) if tr is not None else np.zeros(3)
-                out[sel] = self.locate(P[sel] - shift, abs(fu.number), depth + 1)
+                out[sel] = self.locate(P[sel] - shift, abs(fu.number), depth + 1, sub)
             else:
                 out[sel] = c.number
         out[near] = NEAR
         return out
 
-    def _lattice(self, c, P, depth):
+    def _lattice(self, c, P, depth, paths=None):
         idx, local, near = self.elements[c.number].index(P)
+        if paths is not None:
+            for p in range(len(P)):
+                paths[p].append((c.number, tuple(int(v) for v in idx[p])))
         f = c.fill
         own = _universe_number(c)
         if getattr(f, "multiple_universes", False):
@@ -315,7 +332,8 @@ class _Deck:
         out = np.full(len(P), LOST, dtype=np.int64)  # outside the FILL array: the element doesn't exist (p. 291)
         for u in np.unique(unum[inside]):
             sel = np.flatnonzero(inside & (unum == u))
-            out[sel] = c.number if u == own else self.locate(local[sel], int(u), depth + 1)
+            sub = [paths[p] for p in sel] if paths is not None else None
+            out[sel] = c.number if u == own else self.locate(local[sel], int(u), depth + 1, sub)
         out[near] = NEAR
         return out
 
@@ -334,9 +352,30 @@ def _domain(geometry, has_vacuum):
     return lo, hi
 
 
-def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345):
-    """Return dict(ok, checked_points, errors, skipped_near_surface, reason)."""
-    result = {"ok": False, "checked_points": 0, "errors": [], "skipped_near_surface": 0, "reason": None}
+def _openmc_path(found):
+    """Geometry.find()'s result as an instance path, in Geometry.determine_paths()'s format."""
+    parts = []
+    for item in found:
+        if isinstance(item, tuple):
+            lat, idx = item
+            parts.append(f"l{lat.id}({','.join(str(int(v)) for v in idx)})")
+        elif isinstance(item, openmc.Cell):
+            parts.append(f"c{item.id}")
+        else:
+            parts.append(f"u{item.id}")
+    return "->".join(parts)
+
+
+def chain_text(chain):
+    """An MCNP path [(cell, index or None)], top level first, written as a tally bin."""
+    levels = [f"{c}[{' '.join(map(str, i))}]" if i is not None else str(c) for c, i in reversed(chain)]
+    return levels[0] if len(levels) == 1 else "(" + " < ".join(levels) + ")"
+
+
+def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345, chains=None):
+    """Return dict(ok, checked_points, errors, skipped_near_surface, reason, unhit_chains)."""
+    result = {"ok": False, "checked_points": 0, "errors": [], "skipped_near_surface": 0, "reason": None,
+              "unhit_chains": []}
     try:
         deck = _Deck(problem)
     except NotCheckable as e:
@@ -355,14 +394,20 @@ def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345)
             pts.append(rng.uniform(clo, chi, size=(per_cell, 3)))
     P = np.vstack(pts)
 
+    paths = [[] for _ in range(len(P))] if chains else None
     try:
-        leaf = deck.locate(P)
+        leaf = deck.locate(P, paths=paths)
     except NotCheckable as e:
         result["reason"] = str(e)
         return result
     keep = leaf != NEAR
     result["skipped_near_surface"] = int((~keep).sum())
     P, leaf = P[keep], leaf[keep]
+    if chains:
+        paths = [tuple(paths[i]) for i in np.flatnonzero(keep)]
+        by_chain = {tuple(ch): b for b, (_, ch, _) in enumerate(chains)}
+        by_path = {op: b for b, (_, _, op) in enumerate(chains)}
+        hits = [0] * len(chains)
 
     errors = []
 
@@ -370,10 +415,20 @@ def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345)
         if len(errors) < 20:
             errors.append(msg)
 
-    for p, n in zip(P, leaf):
+    for pi, (p, n) in enumerate(zip(P, leaf)):
         found = geometry.find(tuple(p))
         omc_cell = found[-1] if found and isinstance(found[-1], openmc.Cell) else None
         where = f"({p[0]:.4g}, {p[1]:.4g}, {p[2]:.4g})"
+        if chains:
+            bm, bo = by_chain.get(paths[pi]), by_path.get(_openmc_path(found))
+            if bm != bo:
+                for b in {bm, bo} - {None}:
+                    label, ch, op = chains[b]
+                    add(f"{label}: point {where} is in " + (f"MCNP bin {chain_text(ch)} but not in OpenMC instance {op}"
+                        if b == bm else f"OpenMC instance {op} but not in MCNP bin {chain_text(ch)}")
+                        + f" (MCNP path there: {chain_text(paths[pi]) if paths[pi] else 'none'})")
+            elif bm is not None:
+                hits[bm] += 1
         if n == LOST:
             add(f"point {where} is in no MCNP cell (OpenMC: {'cell ' + str(omc_cell.id) if omc_cell else 'outside'}) -> lost particles")
             continue
@@ -387,6 +442,8 @@ def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345)
         elif mcnp.number != omc_cell.id:
             add(f"point {where}: OpenMC cell {omc_cell.id} ({omc_cell.name}) but MCNP cell {mcnp.number}")
     result["checked_points"] = int(len(P))
+    if chains:
+        result["unhit_chains"] = [chains[b][0] for b in range(len(chains)) if not hits[b]]
 
     # materials and densities, per cell
     for cid, cell in geometry.get_all_cells().items():

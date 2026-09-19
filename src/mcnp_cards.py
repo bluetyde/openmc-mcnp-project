@@ -11,6 +11,7 @@ message saying what and why, instead of emitting a card that would run but model
 something different.
 """
 import math
+import re
 
 import openmc
 import openmc.stats
@@ -320,12 +321,59 @@ def _cyl_fmesh(n, t, m):
             f"\n     KMESH={lst(v / (2 * 3.141592653589793) for v in phi[1:])} KINTS={ones(phi[1:])}")
 
 
-def tally_cards(tallies, geometry, materials=None, detector_responses=None):
+def _instance_bins(t, f, geometry, lattices):
+    """MCNP tally bins for a CellInstanceFilter. Each (cell, instance) becomes the path from that cell up to
+    universe 0, (c < L[i j k] < ... < c0) (manual p. 452-455), read from OpenMC's instance path
+    u4->c4->l2(1,0,0)->u1->c1. L is the lattice's MCNP LAT cell and [i j k] its MCNP index, both from
+    lattice_cards.rewrite(). Returns [(bin text, openmc cell)]."""
+    cells = geometry.get_all_cells()
+    geometry.determine_paths()
+    out = []
+    for cid, inst in f.bins:
+        cell = cells.get(int(cid))
+        if cell is None:
+            raise UnsupportedFeature(f"Tally '{t.name}' refers to cell {cid}, which isn't in the geometry.")
+        paths = cell.paths
+        if not 0 <= int(inst) < len(paths):
+            raise UnsupportedFeature(f"Tally '{t.name}': cell {cid} has no instance {inst} ({len(paths)} instances).")
+        levels = []
+        for part in paths[int(inst)].split("->"):
+            if part[0] == "c":
+                levels.append(part[1:])
+            elif part[0] == "l":
+                m = re.fullmatch(r"l(\d+)\(([-\d,]+)\)", part)
+                L, idx = int(m.group(1)), tuple(int(v) for v in m.group(2).split(","))
+                idx += (0,) * (3 - len(idx))
+                info = (lattices or {}).get(L)
+                if info is None or idx not in info["index"]:
+                    raise UnsupportedFeature(f"Tally '{t.name}': lattice {L} element {idx} (cell {cid}, instance {inst}) "
+                                             f"has no MCNP lattice element to tally.")
+                levels.append(f"{info['cell']}[{' '.join(map(str, info['index'][idx]))}]")
+        out.append((levels[0] if len(levels) == 1 else "(" + " < ".join(reversed(levels)) + ")", cell))
+    return out
+
+
+def _bin_card(head, bins, width=78):
+    """A tally card whose bins don't fit on one line: continuation lines start with 5 spaces, and a bin
+    (which may be a chain with spaces) is never split."""
+    lines, line = [], head
+    for b in bins:
+        if len(line) + 1 + len(b) > width and line.strip():
+            lines.append(line)
+            line = "     " + b
+        else:
+            line += " " + b
+    return "\n".join(lines + [line])
+
+
+def tally_cards(tallies, geometry, materials=None, detector_responses=None, lattices=None):
     """F4/E4/FM/SD for cell tallies and FMESH for regular-mesh tallies.
 
     Returns (cards, notes). Cell tallies get SD=1 so MCNP reports volume-integrated
     values like OpenMC (MCNP's F4 divides by volume by default). One MCNP tally per
     OpenMC score, since flux and each reaction need their own multiplier.
+    A CellInstanceFilter (one cell in one lattice element) becomes chain bins; `lattices` is the index map
+    lattice_cards.rewrite() fills.
     """
     cards, notes = [], []
     cells = geometry.get_all_cells()
@@ -333,10 +381,12 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None):
     for t in tallies or []:
         if t.nuclides and list(t.nuclides) != ["total"]:
             raise UnsupportedFeature(f"Tally '{t.name}': per-nuclide tallies aren't supported.")
-        cell_f = energy_f = mesh_f = energy_fn_f = None
+        cell_f = inst_f = energy_f = mesh_f = energy_fn_f = None
         for f in t.filters:
             if isinstance(f, openmc.CellFilter):
                 cell_f = f
+            elif isinstance(f, openmc.CellInstanceFilter):
+                inst_f = f
             elif isinstance(f, openmc.EnergyFilter):
                 energy_f = f
             elif isinstance(f, openmc.MeshFilter):
@@ -351,8 +401,17 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None):
                                          f"Remove the tally to export the rest.")
             else:
                 raise UnsupportedFeature(f"Tally '{t.name}': {type(f).__name__} isn't supported.")
-        if bool(cell_f) == bool(mesh_f):
-            raise UnsupportedFeature(f"Tally '{t.name}': needs exactly one CellFilter or MeshFilter.")
+        if sum(f is not None for f in (cell_f, inst_f, mesh_f)) != 1:
+            raise UnsupportedFeature(f"Tally '{t.name}': needs exactly one CellFilter, CellInstanceFilter or MeshFilter.")
+        bins = None  # [(MCNP bin text, openmc cell)]
+        if cell_f is not None:
+            ids = [int(c) for c in cell_f.bins]
+            missing = [c for c in ids if c not in cells]
+            if missing:
+                raise UnsupportedFeature(f"Tally '{t.name}' refers to cells {missing} that aren't in the geometry.")
+            bins = [(str(c), cells[c]) for c in ids]
+        elif inst_f is not None:
+            bins = _instance_bins(t, inst_f, geometry, lattices)
 
         e_card = None
         if energy_f is not None:
@@ -369,20 +428,16 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None):
             if score != "flux" and score not in SCORE_FM:
                 raise UnsupportedFeature(f"Tally '{t.name}': score '{score}' isn't supported "
                                          f"(supported: flux, {', '.join(SCORE_FM)}).")
-            if cell_f is not None:
-                ids = [int(c) for c in cell_f.bins]
-                missing = [c for c in ids if c not in cells]
-                if missing:
-                    raise UnsupportedFeature(f"Tally '{t.name}' refers to cells {missing} that aren't in the geometry.")
-                cards.append(f"F{n}:N " + " ".join(str(c) for c in ids))
+            if bins is not None:
+                cards.append(_bin_card(f"F{n}:N", [b for b, _ in bins]))
                 cards.append(f"FC{n} {label}")
                 if score != "flux":
-                    mats = {cells[c].fill.id if isinstance(cells[c].fill, openmc.Material) else None for c in ids}
+                    mats = {c.fill.id if isinstance(c.fill, openmc.Material) else None for _, c in bins}
                     if len(mats) != 1 or None in mats:
                         raise UnsupportedFeature(f"Tally '{t.name}' score '{score}': all tallied cells must share "
                                                  f"one material (found {sorted(str(m) for m in mats)}).")
                     mat_id = mats.pop()
-                    if score == "absorption" and _can_fission(cells[ids[0]].fill):
+                    if score == "absorption" and _can_fission(bins[0][1].fill):
                         raise UnsupportedFeature(
                             f"Tally '{t.name}': 'absorption' in material {mat_id} can't be exported faithfully. MCNP's "
                             f"absorption (-2) excludes fission and this material has actinides; tally 'fission' and "
@@ -394,7 +449,7 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None):
                     notes.append(note)
                 if e_card:
                     cards.append(f"E{n} {e_card}")
-                cards.append(f"SD{n} " + " ".join("1" for _ in ids))
+                cards.append(_bin_card(f"SD{n}", ["1"] * len(bins)))
             else:
                 if score != "flux":
                     raise UnsupportedFeature(f"Tally '{t.name}': mesh tallies support only 'flux' "
