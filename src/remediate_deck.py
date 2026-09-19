@@ -31,7 +31,14 @@ from mcnp_cards import UnsupportedFeature
 
 
 def load_model(path):
-    """Load an OpenMC model from model.xml, or from a folder holding model.xml or the separate XML files."""
+    """Load an OpenMC model from model.xml, or from a folder holding model.xml or the separate XML files.
+    Hex lattices with one axial level are repaired after reading (lattice_cards.fix_loaded_hex_lattices)."""
+    model = _load_model(path)
+    lattice_cards.fix_loaded_hex_lattices(model)
+    return model
+
+
+def _load_model(path):
     if os.path.isdir(path):
         if os.path.exists(os.path.join(path, "model.xml")):
             return openmc.Model.from_model_xml(os.path.join(path, "model.xml"))

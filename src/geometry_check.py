@@ -19,9 +19,10 @@ to the lattice's own universe fills that element with the lattice cell's materia
 places the filling universe's origin at o in the filled cell's coordinates (p. 291).
 
 Supported MCNP surfaces: P (4-constant form), PX/PY/PZ, SO, S, SX/SY/SZ, CX/CY/CZ,
-C/X, C/Y, C/Z, GQ (rotated cylinders and other general quadrics). Lattice elements must be bounded by
-PX/PY/PZ planes (LAT=1). Decks with other surface types, surface transformations, TRCL, rotated fills or
-hexagonal (LAT=2) lattices are reported as not checkable rather than silently passed.
+C/X, C/Y, C/Z, GQ (rotated cylinders and other general quadrics). Lattice elements must be bounded by planes:
+LAT=1 rectangular boxes, or LAT=2 hexagonal prisms along z whose faces are listed in the manual's order
+(p. 290); a LAT=2 point is placed in the nearest hexagon. Decks with other surface types, surface
+transformations, TRCL or rotated fills are reported as not checkable rather than silently passed.
 """
 import math
 from collections import defaultdict
@@ -141,25 +142,92 @@ def _universe_number(cell):
     return abs(cell.universe.number) if cell.universe is not None else 0
 
 
-def _lattice_axes(cell, surfaces_by_num):
-    """LAT=1 element from its surfaces in written order: [(axis, c_first, c_second), ...] for i, j (, k).
-    Element index along an axis is floor((x - c_second) / (c_first - c_second)) (p. 290)."""
-    leaves = _leaves(cell.geometry)
-    if any(l.is_cell for l in leaves) or len(leaves) not in (4, 6):
-        raise NotCheckable(f"lattice cell {cell.number} isn't bounded by 4 or 6 planes")
-    axes = []
-    for a, b in zip(leaves[0::2], leaves[1::2]):
-        sa, sb = surfaces_by_num[a.divider.number], surfaces_by_num[b.divider.number]
-        ta, tb = str(sa.surface_type).upper(), str(sb.surface_type).upper()
-        if ta != tb or ta not in ("PX", "PY", "PZ"):
-            raise NotCheckable(f"lattice cell {cell.number}: element surfaces must be PX/PY/PZ pairs")
-        ca, cb = float(sa.surface_constants[0]), float(sb.surface_constants[0])
-        if ca == cb:
-            raise NotCheckable(f"lattice cell {cell.number}: zero-width element")
-        axes.append(("XYZ".index(ta[1]), ca, cb))
-    if len({a for a, _, _ in axes}) != len(axes):
-        raise NotCheckable(f"lattice cell {cell.number}: two surface pairs on the same axis")
-    return axes
+def _halfspace(leaf, surfaces_by_num, cell):
+    """A lattice cell's half-space as (unit normal n, d) with the element on the side n . x < d."""
+    s = surfaces_by_num[leaf.divider.number]
+    t = str(s.surface_type).upper()
+    c = [float(v) for v in s.surface_constants]
+    if t in ("PX", "PY", "PZ"):
+        n, d = np.eye(3)["XYZ".index(t[1])], c[0]
+    elif t == "P" and len(c) == 4:
+        n, d = np.array(c[:3]), c[3]
+    else:
+        raise NotCheckable(f"lattice cell {cell.number}: element surfaces must be planes (P, PX, PY, PZ)")
+    norm = float(np.linalg.norm(n))
+    n, d = n / norm, d / norm
+    return (-n, -d) if leaf.side else (n, d)  # positive sense means the element is on the n . x > d side
+
+
+class _Element:
+    """The [0,0,0] element of a LAT=1 or LAT=2 cell, read from its surfaces in the order written (p. 290):
+    each pair of opposite faces (a, b) gives an index step T = n_a (d_a + d_b), and element [1,0,0] lies
+    beyond the first surface. `index(P)` returns lattice indices, points in the element's own coordinates, and
+    which points sit on an element face."""
+
+    def __init__(self, cell, surfaces_by_num):
+        self.cell = cell
+        lt = int(getattr(cell.lattice_type, "value", cell.lattice_type))
+        leaves = _leaves(cell.geometry)
+        if any(l.is_cell for l in leaves):
+            raise NotCheckable(f"lattice cell {cell.number} uses a cell complement")
+        hs = [_halfspace(l, surfaces_by_num, cell) for l in leaves]
+        if lt == 1 and len(hs) not in (4, 6) or lt == 2 and len(hs) not in (6, 8) or lt not in (1, 2):
+            raise NotCheckable(f"lattice cell {cell.number}: LAT={lt} with {len(hs)} surfaces")
+        self.pairs = []
+        for (na, da), (nb, db) in zip(hs[0::2], hs[1::2]):
+            if not np.allclose(nb, -na, atol=1e-9):
+                raise NotCheckable(f"lattice cell {cell.number}: surfaces {len(self.pairs) * 2 + 1} and "
+                                   f"{len(self.pairs) * 2 + 2} aren't opposite faces")
+            self.pairs.append((na, da, db, na * (da + db)))
+        self.hex = lt == 2
+        if self.hex:
+            (n1, d1, e1, T1), (n3, d3, e3, T3), (_, _, _, T5) = self.pairs[:3]
+            if not np.allclose(T5, T3 - T1, atol=1e-6 * float(np.linalg.norm(T1))):
+                raise NotCheckable(f"lattice cell {cell.number}: faces aren't in MCNP's LAT=2 order "
+                                   f"([1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [-1,1,0], [1,-1,0])")
+            if abs(T1[2]) > 1e-9 or abs(T3[2]) > 1e-9:
+                raise NotCheckable(f"lattice cell {cell.number}: hexagonal faces must be parallel to z")
+            A = np.array([[n1[0], n1[1]], [n3[0], n3[1]]])
+            self.c0 = np.linalg.solve(A, [(d1 - e1) / 2, (d3 - e3) / 2])  # centre of element [0,0,0] in x, y
+            self.B = np.linalg.inv(np.array([[T1[0], T3[0]], [T1[1], T3[1]]]))
+            self.faces = [(n, d) for n, d, _, _ in self.pairs[:3]] + [(-n, e) for n, _, e, _ in self.pairs[:3]]
+            if len(self.pairs) == 4 and abs(abs(self.pairs[3][0][2]) - 1) > 1e-9:
+                raise NotCheckable(f"lattice cell {cell.number}: the base planes must be normal to z")
+        else:
+            N = np.array([n for n, _, _, _ in self.pairs])
+            if not np.allclose(N @ N.T, np.eye(len(N)), atol=1e-9):
+                raise NotCheckable(f"lattice cell {cell.number}: only rectangular (orthogonal) LAT=1 elements are checked")
+
+    def index(self, P):
+        idx = np.zeros((len(P), 3), dtype=np.int64)
+        local = P.copy()
+        near = np.zeros(len(P), dtype=bool)
+        axial = self.pairs[3:] if self.hex else self.pairs
+        first = 2 if self.hex else 0
+        for k, (n, d, e, T) in enumerate(axial):  # element i spans n . x in (-e + i w, d + i w)
+            w = d + e
+            t = (P @ n + e) / w
+            i = np.floor(t).astype(np.int64)
+            near |= np.abs(t - np.round(t)) * w < SURFACE_TOL
+            idx[:, first + k] = i
+            local -= np.outer(i, T)
+        if self.hex:  # nearest hexagon centre: round the (i, j) coordinates as cube coordinates
+            T1, T3 = self.pairs[0][3], self.pairs[1][3]
+            ab = (local[:, :2] - self.c0) @ self.B.T
+            q, r = ab[:, 0], ab[:, 1]
+            s = -q - r
+            rq, rr, rs = np.round(q), np.round(r), np.round(s)
+            dq, dr, ds = np.abs(rq - q), np.abs(rr - r), np.abs(rs - s)
+            fix_q = (dq > dr) & (dq > ds)
+            fix_r = ~fix_q & (dr > ds)
+            rq = np.where(fix_q, -rr - rs, rq)
+            rr = np.where(fix_r, -rq - rs, rr)
+            i, j = rq.astype(np.int64), rr.astype(np.int64)
+            idx[:, 0], idx[:, 1] = i, j
+            local -= np.outer(i, T1) + np.outer(j, T3)
+            for n, d in self.faces:
+                near |= np.abs(local @ n - d) < SURFACE_TOL
+        return idx, local, near
 
 
 class _Deck:
@@ -181,11 +249,8 @@ class _Deck:
                     raise NotCheckable(f"MCNP cell {c.number} fills with a rotation")
                 if not getattr(tr, "is_main_to_aux", True):
                     raise NotCheckable(f"MCNP cell {c.number}: FILL displacement given in the universe's system (m = -1)")
-            lt = getattr(c, "lattice_type", None)
-            if lt is not None and int(getattr(lt, "value", lt)) != 1:
-                raise NotCheckable(f"MCNP cell {c.number} is a hexagonal (LAT=2) lattice")
-        self.lattice_axes = {c.number: _lattice_axes(c, self.surfaces_by_num)
-                             for c in problem.cells if getattr(c, "lattice_type", None) is not None}
+        self.elements = {c.number: _Element(c, self.surfaces_by_num)
+                         for c in problem.cells if getattr(c, "lattice_type", None) is not None}
 
     def locate(self, P, universe=0, depth=0):
         """MCNP leaf cell number for each point of P (in `universe`'s coordinates), or LOST / OVERLAP / NEAR."""
@@ -195,7 +260,7 @@ class _Deck:
         if depth > 20:
             raise NotCheckable("more than 20 universe levels")
         cells = self.by_universe.get(universe, [])
-        lat = [c for c in cells if c.number in self.lattice_axes]
+        lat = [c for c in cells if c.number in self.elements]
         if lat:  # a lattice is the only cell of its universe and repeats forever (p. 289): index every point
             if len(cells) != 1:
                 raise NotCheckable(f"universe {universe} has a lattice cell and other cells")
@@ -220,7 +285,7 @@ class _Deck:
                 continue
             f = c.fill
             fu = getattr(f, "universe", None) if f is not None else None
-            if c.number in self.lattice_axes:
+            if c.number in self.elements:
                 out[sel] = self._lattice(c, P[sel], depth)
             elif fu is not None:
                 tr = getattr(f, "transform", None)
@@ -232,17 +297,7 @@ class _Deck:
         return out
 
     def _lattice(self, c, P, depth):
-        axes = self.lattice_axes[c.number]
-        idx = np.zeros((len(P), 3), dtype=np.int64)
-        local = P.copy()
-        near = np.zeros(len(P), dtype=bool)
-        for n, (axis, ca, cb) in enumerate(axes):
-            d = ca - cb
-            t = (P[:, axis] - cb) / d
-            i = np.floor(t).astype(np.int64)
-            near |= np.abs(t - np.round(t)) * abs(d) < SURFACE_TOL
-            idx[:, n] = i
-            local[:, axis] = P[:, axis] - i * d
+        idx, local, near = self.elements[c.number].index(P)
         f = c.fill
         own = _universe_number(c)
         if getattr(f, "multiple_universes", False):

@@ -38,7 +38,7 @@ def translate(model, out_path, stdout=None):
         raise RuntimeError("MCNPy is not importable in this environment. See CLAUDE.md 'MCNPy install notes'. "
                            f"Original error: {e}")
     notes = lattice_cards.prepare(model)
-    with contextlib.redirect_stdout(stdout if stdout is not None else io.StringIO()):
+    with contextlib.redirect_stdout(stdout if stdout is not None else io.StringIO()), lattice_cards.mcnpy_view(model):
         deck = openmc_to_mcnp(model.geometry, model.materials, model.settings)
         deck.write(out_path)
     return notes

@@ -1,5 +1,5 @@
 """
-Rectangular lattices (openmc.RectLattice) as MCNP LAT=1 / FILL cards.
+OpenMC lattices as MCNP lattice cards: RectLattice -> LAT=1, HexLattice -> LAT=2 (with FILL).
 
 MCNPy translates the rest of a model faithfully but gets lattices wrong: it moves the unit universe's cells
 with TRCL, writes an element box that isn't centred on them, and picks index ranges that don't cover the
@@ -18,9 +18,16 @@ Page numbers are PDF pages of the MCNP 6.3.0 manual (LA-UR-22-30006 Rev. 1).
                 filled cell's coordinates (p. 291, "FILL = n (o1 o2 o3 ...)").
   unit cells    in the unit universes' own coordinates, so MCNPy's TRCL on them is removed.
 Surfaces of repeated structures must be numbered <= 999 (p. 271).
+
+HexLattice (LAT=2): an element is a hexagonal prism; its 8 surfaces are listed [1,0,0], [-1,0,0], [0,1,0],
+[0,-1,0], [-1,1,0], [1,-1,0], then the two base planes (p. 290, example p. 766). [0,1,0] must be next to
+[1,0,0], so the index steps T1 and T2 are neighbour directions 60 degrees apart and [-1,1,0] is at T2 - T1.
+MCNPy can't translate hex lattices at all, so mcnpy_view() shows it a placeholder while it runs.
 """
+import contextlib
 import math
 import re
+import warnings
 
 import openmc
 
@@ -37,6 +44,21 @@ def _fmt(v):
 
 
 FAR = 1.0e9  # cm: "infinite" for the two workarounds below
+
+
+def fix_loaded_hex_lattices(model):
+    """OpenMC 0.15.3's Python XML reader drops the axial level of a HexLattice with n_axial="1": the lattice
+    comes back with a z pitch but universes [ring][position] and num_axial None, so openmc.Geometry.find()
+    treats it as 2D (no z shift), while OpenMC's transport code (checked with openmc.lib.find_cell) keeps it
+    3D. Re-nest such lattices so Python agrees with transport. Returns the lattice IDs fixed."""
+    fixed = []
+    for lat in model.geometry.get_all_lattices().values():
+        if isinstance(lat, openmc.HexLattice) and len(lat.pitch) == 2 and not lat.num_axial:
+            u = lat.universes
+            if len(u) and isinstance(u[0], (list, tuple)) and len(u[0]) and not isinstance(u[0][0], (list, tuple)):
+                lat.universes = [[list(ring) for ring in u]]
+                fixed.append(lat.id)
+    return fixed
 
 
 def prepare(model):
@@ -131,15 +153,133 @@ def _wrap(text):
     return "\n".join(out)
 
 
+@contextlib.contextmanager
+def mcnpy_view(model):
+    """While MCNPy translates: swap each HexLattice for a placeholder RectLattice with the same ID holding the
+    same universes. MCNPy 0.0.7 can't translate hex lattices at all ('NoneType' object is not subscriptable),
+    but it still has to translate the universes inside them; rewrite() then writes the real LAT=2 card."""
+    swaps = []
+    cells = model.geometry.get_all_cells().values()
+    for lat in list(model.geometry.get_all_lattices().values()):
+        if not isinstance(lat, openmc.HexLattice):
+            continue
+        us = list({u.id: u for u in lat.get_unique_universes().values()}.values())
+        if lat.outer is not None and all(u.id != lat.outer.id for u in us):
+            us.append(lat.outer)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the placeholder reuses the hex lattice's ID on purpose
+            ph = openmc.RectLattice(lattice_id=lat.id, name="placeholder for a hex lattice")
+        ph.pitch, ph.lower_left, ph.universes = (1.0, 1.0, 1.0), (0.0, 0.0, 0.0), [[us]]
+        filled = [c for c in cells if c.fill is lat]
+        for c in filled:
+            c.fill = ph
+        swaps.append((filled, lat))
+    try:
+        yield
+    finally:
+        for filled, lat in swaps:
+            for c in filled:
+                c.fill = lat
+
+
+def _filled_bounds(lat, filled):
+    for c in filled:
+        if c.translation is not None or c.rotation is not None:
+            raise UnsupportedFeature(f"Cell {c.id} fills lattice {lat.id} with a translation or rotation; not supported yet.")
+        yield c, c.region.bounding_box
+
+
+def _rect_layout(lat, filled):
+    """LAT=1 from an openmc.RectLattice. Element [0,0,0] is the lattice's first element (lower_left corner);
+    OpenMC's rows are listed top (+y) first, so j = ny - 1 - row."""
+    pitch = [float(p) for p in lat.pitch]
+    u = lat.universes if len(pitch) == 3 else [lat.universes]  # [z][y, top row first][x]
+    nz, ny, nx = len(u), len(u[0]), len(u[0][0])
+    dims = [nx, ny, nz]
+    planes = []  # +x, -x, +y, -y (, +z, -z) around the origin (p. 290)
+    for axis, p in zip("XYZ", pitch):
+        planes += [(f"P{axis}", (p / 2,), "-"), (f"P{axis}", (-p / 2,), "+")]
+    ll = [float(v) for v in lat.lower_left]
+    lo, hi = [0, 0, 0], [nx - 1, ny - 1, nz - 1]
+    for c, (blo, bhi) in _filled_bounds(lat, filled):
+        for k in range(len(pitch)):
+            if dims[k] == 1 and pitch[k] >= 2 * FAR:
+                continue  # the one z layer prepare() made from a 2D lattice covers everything
+            if not (math.isfinite(blo[k]) and math.isfinite(bhi[k])):
+                if lat.outer is None:
+                    continue  # unbounded along k with no outer: OpenMC loses particles there too
+                raise UnsupportedFeature(f"Cell {c.id} (filled by lattice {lat.id}) is unbounded along {'xyz'[k]}.")
+            a = math.floor((blo[k] - ll[k]) / pitch[k] + 1e-9)
+            b = math.ceil((bhi[k] - ll[k]) / pitch[k] - 1e-9) - 1
+            if (a < 0 or b > dims[k] - 1) and lat.outer is None:
+                raise UnsupportedFeature(f"Lattice {lat.id} doesn't cover cell {c.id} and has no outer universe.")
+            lo[k], hi[k] = min(lo[k], a), max(hi[k], b)
+
+    def uni(i, j, k):
+        if 0 <= i < nx and 0 <= j < ny and 0 <= k < nz:
+            return u[k][ny - 1 - j][i].id
+        return lat.outer.id
+    ids = [uni(i, j, k) for k in range(lo[2], hi[2] + 1) for j in range(lo[1], hi[1] + 1) for i in range(lo[0], hi[0] + 1)]
+    single = lo == [0, 0, 0] and hi == [nx - 1, ny - 1, nz - 1] and len(set(ids)) == 1
+    origin = [ll[k] + pitch[k] / 2 for k in range(len(pitch))] + ([0.0] if len(pitch) == 2 else [])
+    return 1, planes, lo, hi, ids, single, origin, f"pitch {pitch}"
+
+
+def _hex_layout(lat, filled):
+    """LAT=2 from an openmc.HexLattice. Element [0,0,0] is the lattice's centre element (bottom axial level).
+    The index steps are two neighbour directions 60 degrees apart, T1 and T2, so [-1,1,0] (5th surface) sits at
+    T2 - T1 as the manual requires (p. 290, 766). Which universe fills element [i,j,k] is asked from OpenMC
+    (find_element at the element's centre), so OpenMC's own ring and index conventions don't matter here."""
+    p = float(lat.pitch[0])
+    three_d = len(lat.pitch) == 2
+    pz = float(lat.pitch[1]) if three_d else None
+    s3 = math.sqrt(3.0) / 2
+    T1, T2 = ((s3 * p, p / 2), (0.0, p)) if lat.orientation == "y" else ((p, 0.0), (p / 2, s3 * p))
+    dirs = []
+    for v in (T1, T2, (T2[0] - T1[0], T2[1] - T1[1])):
+        n = (v[0] / p, v[1] / p)
+        dirs += [n, (-n[0], -n[1])]
+    # faces n . x = p/2, listed [1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [-1,1,0], [1,-1,0], then the bases
+    planes = [("P", (n[0], n[1], 0.0, p / 2), "-") for n in dirs]
+    if three_d:
+        planes += [("PZ", (pz / 2,), "-"), ("PZ", (-pz / 2,), "+")]
+    cx, cy = float(lat.center[0]), float(lat.center[1])
+    # After a model.xml round trip num_axial is None and a one-level lattice comes back as [ring][position], so
+    # count axial levels only when the universes really are nested three deep ([axial][ring][position]).
+    u = lat.universes
+    nested = len(u) > 0 and isinstance(u[0], (list, tuple)) and len(u[0]) > 0 and isinstance(u[0][0], (list, tuple))
+    nz = (lat.num_axial or (len(u) if nested else 1)) if three_d else 1
+    z0 = float(lat.center[2]) - (nz - 1) / 2 * pz if three_d else 0.0
+    M, klo, khi = lat.num_rings, 0, nz - 1
+    for c, (blo, bhi) in _filled_bounds(lat, filled):
+        if not all(math.isfinite(v) for v in (blo[0], blo[1], bhi[0], bhi[1])):
+            raise UnsupportedFeature(f"Cell {c.id} (filled by hex lattice {lat.id}) is unbounded across the lattice.")
+        rmax = max(math.hypot(x - cx, y - cy) for x in (blo[0], bhi[0]) for y in (blo[1], bhi[1]))
+        M = max(M, math.ceil(rmax / (s3 * p)) + 1)
+        if three_d and math.isfinite(blo[2]) and math.isfinite(bhi[2]):
+            klo = min(klo, math.floor((blo[2] - (z0 - pz / 2)) / pz + 1e-9))
+            khi = max(khi, math.ceil((bhi[2] - (z0 - pz / 2)) / pz - 1e-9) - 1)
+    lo, hi = [-M, -M, klo], [M, M, khi]
+    ids = []
+    for k in range(klo, khi + 1):
+        for j in range(-M, M + 1):
+            for i in range(-M, M + 1):
+                pt = (cx + i * T1[0] + j * T2[0], cy + i * T1[1] + j * T2[1], z0 + k * pz if three_d else 0.0)
+                idx, _ = lat.find_element(pt)
+                if lat.is_valid_index(idx):
+                    ids.append(lat.get_universe(idx).id)
+                elif lat.outer is not None:
+                    ids.append(lat.outer.id)
+                else:
+                    raise UnsupportedFeature(f"Hex lattice {lat.id} doesn't cover its cell and has no outer universe.")
+    return 2, planes, lo, hi, ids, len(set(ids)) == 1, [cx, cy, z0], f"pitch {list(lat.pitch)}, {lat.orientation} orientation"
+
+
 def rewrite(blocks, model):
     """Rewrite MCNPy's lattice cards in a deck split into blocks [cells, surfaces, data...], in place.
     Returns notes."""
     geometry = model.geometry
-    universes = geometry.get_all_lattices().values()  # get_all_universes() leaves lattices out
-    hexes = [u.id for u in universes if isinstance(u, openmc.HexLattice)]
-    if hexes:
-        raise UnsupportedFeature(f"Hexagonal lattices {hexes} aren't exported as MCNP LAT=2 yet; write them cell by cell.")
-    lattices = [u for u in universes if isinstance(u, openmc.RectLattice)]
+    lattices = list(geometry.get_all_lattices().values())  # get_all_universes() leaves lattices out
     if not lattices:
         return []
     header, cards = _split_cards(blocks[0])
@@ -158,61 +298,27 @@ def rewrite(blocks, model):
         old_elem_surfs |= _geom_surfs(body)
         dropped_tr |= _trcl_numbers(body)
         imp = " ".join(re.findall(r"\bIMP:[A-Za-z,]+\s*=\s*\S+", body, re.I)) or "IMP:N=1"
-
-        pitch = [float(p) for p in lat.pitch]
-        u = lat.universes if len(pitch) == 3 else [lat.universes]  # [z][y, top row first][x]
-        nz, ny, nx = len(u), len(u[0]), len(u[0][0])
-        dims = [nx, ny, nz]
-
-        # the [0,0,0] element around the origin: +x, -x, +y, -y (, +z, -z) planes in that order (p. 290)
-        planes = []
-        for axis, p in zip("XYZ", pitch):
-            for sign in (1, -1):
-                if next_surf > MAX_RS_SURFACE:
-                    raise UnsupportedFeature(f"Lattice {L}: MCNP needs repeated-structure surfaces numbered <= 999 "
-                                             f"(manual p. 271); this deck already reaches {next_surf - 1}.")
-                new_surfaces.append(f"{next_surf} P{axis} {_fmt(sign * p / 2)}")
-                planes.append(next_surf)
-                next_surf += 1
-        region = " ".join(f"-{s}" if i % 2 == 0 else f"{s}" for i, s in enumerate(planes))
-
-        # index ranges: 0..n-1, widened (with lat.outer) where a filled cell reaches past the lattice
         filled = [c for c in all_cells.values() if c.fill is lat]
         if not filled:
             raise UnsupportedFeature(f"Lattice {L} isn't used by any cell.")
-        ll = [float(v) for v in lat.lower_left]
-        lo_idx, hi_idx = [0, 0, 0], [nx - 1, ny - 1, nz - 1]
-        for c in filled:
-            if c.translation is not None or c.rotation is not None:
-                raise UnsupportedFeature(f"Cell {c.id} fills lattice {L} with a translation or rotation; not supported yet.")
-            blo, bhi = c.region.bounding_box
-            for k in range(len(pitch)):
-                if dims[k] == 1 and pitch[k] >= 2 * FAR:
-                    continue  # the one z layer prepare() made from a 2D lattice covers everything
-                if not (math.isfinite(blo[k]) and math.isfinite(bhi[k])):
-                    if lat.outer is None:
-                        continue  # unbounded along k with no outer: OpenMC loses particles there too
-                    raise UnsupportedFeature(f"Cell {c.id} (filled by lattice {L}) is unbounded along {'xyz'[k]}.")
-                a = math.floor((blo[k] - ll[k]) / pitch[k] + 1e-9)
-                b = math.ceil((bhi[k] - ll[k]) / pitch[k] - 1e-9) - 1
-                if (a < 0 or b > dims[k] - 1) and lat.outer is None:
-                    raise UnsupportedFeature(f"Lattice {L} doesn't cover cell {c.id} and has no outer universe.")
-                lo_idx[k], hi_idx[k] = min(lo_idx[k], a), max(hi_idx[k], b)
-
-        def uni(i, j, k):
-            if 0 <= i < nx and 0 <= j < ny and 0 <= k < nz:
-                return u[k][ny - 1 - j][i].id
-            return lat.outer.id
-        ids = [uni(i, j, k) for k in range(lo_idx[2], hi_idx[2] + 1)
-               for j in range(lo_idx[1], hi_idx[1] + 1) for i in range(lo_idx[0], hi_idx[0] + 1)]
-        if lo_idx == [0, 0, 0] and hi_idx == [nx - 1, ny - 1, nz - 1] and len(set(ids)) == 1:
-            fill = f"FILL={ids[0]}"
+        if isinstance(lat, openmc.RectLattice):
+            lat_type, planes, lo, hi, ids, single, origin, desc = _rect_layout(lat, filled)
         else:
-            fill = "FILL=" + " ".join(f"{a}:{b}" for a, b in zip(lo_idx, hi_idx)) + " " + " ".join(map(str, ids))
-        cards[elem[0]] = _wrap(f"{num} 0 {region} U={L} LAT=1 {fill} {imp}")
+            lat_type, planes, lo, hi, ids, single, origin, desc = _hex_layout(lat, filled)
+
+        region = []
+        for kind, params, sense in planes:
+            if next_surf > MAX_RS_SURFACE:
+                raise UnsupportedFeature(f"Lattice {L}: MCNP needs repeated-structure surfaces numbered <= 999 "
+                                         f"(manual p. 271); this deck already reaches {next_surf - 1}.")
+            new_surfaces.append(f"{next_surf} {kind} " + " ".join(_fmt(v) for v in params))
+            region.append(f"{sense if sense == '-' else ''}{next_surf}")
+            next_surf += 1
+        fill = f"FILL={ids[0]}" if single else ("FILL=" + " ".join(f"{a}:{b}" for a, b in zip(lo, hi)) + " "
+                                                   + " ".join(map(str, ids)))
+        cards[elem[0]] = _wrap(f"{num} 0 {' '.join(region)} U={L} LAT={lat_type} {fill} {imp}")
 
         # the filled cells look at the lattice universe with its origin at the centre of element [0,0,0]
-        origin = [ll[k] + pitch[k] / 2 for k in range(len(pitch))] + ([0.0] if len(pitch) == 2 else [])
         for c in filled:
             i = by_num.get(c.id)
             if i is None:
@@ -234,8 +340,8 @@ def rewrite(blocks, model):
                                              f"not supported yet.")
                 dropped_tr |= _trcl_numbers(b)
                 cards[idx] = _wrap(re.sub(r"\s\*?TRCL\s*=?\s*(\([^)]*\)|\d+)", "", b, flags=re.I))
-        notes.append(f"Lattice {L}: MCNP LAT=1 cell {num}, pitch {pitch}, element [0,0,0] centred at "
-                     f"{[round(v, 6) for v in origin]}, indices {lo_idx} to {hi_idx}.")
+        notes.append(f"Lattice {L}: MCNP LAT={lat_type} cell {num}, {desc}, element [0,0,0] centred at "
+                     f"{[round(v, 6) for v in origin]}, indices {lo} to {hi}.")
 
     # surfaces: drop MCNPy's element boxes if nothing uses them now, then add the new planes
     used_surfs = set().union(*(_geom_surfs(_body(c)) for c in cards))

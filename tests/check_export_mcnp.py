@@ -9,6 +9,7 @@ Self-test for src/export_mcnp.py and src/validate_deck.py.
 3. Asserts unsupported features are refused instead of exported.
 4. Exports rectangular lattices as LAT=1 / FILL cards and breaks them (surface order, FILL origin, FILL
    array order, a TRCL) to show the geometry check notices each mistake.
+5. Does the same for hexagonal lattices (LAT=2), in both orientations, with face-order mistakes.
 
 Run from the project root, in the openmc-mcnp env:
     python tests/check_export_mcnp.py
@@ -214,6 +215,39 @@ def lattice_2d_outer_model():
     return openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
 
 
+def hex_lattice_model(orientation="y", two_levels=True):
+    """A 3-ring HexLattice of rods with an asymmetric pattern (steel and water rods, one site different in
+    each ring), two axial levels that differ, and an outer universe, inside a larger cylinder: every
+    index-direction or ordering mistake in the MCNP cards changes which rod is where."""
+    openmc.reset_auto_ids()
+    steel, water = _lattice_materials()
+    rod = openmc.ZCylinder(r=0.9)
+    pin = openmc.Universe(cells=[openmc.Cell(name="Steel rod", fill=steel, region=-rod),
+                                 openmc.Cell(name="Rod water", fill=water, region=+rod)])
+    thin = openmc.ZCylinder(r=0.4)
+    wire = openmc.Universe(cells=[openmc.Cell(name="Steel wire", fill=steel, region=-thin),
+                                  openmc.Cell(name="Wire water", fill=water, region=+thin)])
+    outer = openmc.Universe(cells=[openmc.Cell(name="Outer water", fill=water)])
+    lat = openmc.HexLattice(name="Hex rods")
+    lat.orientation = orientation
+    level_a = [[pin] * 3 + [wire] + [pin] * 8, [wire] + [pin] * 5, [pin]]    # outer ring first
+    level_b = [[pin] * 7 + [wire] * 2 + [pin] * 3, [pin] * 4 + [wire] + [pin], [wire]]
+    if two_levels:
+        lat.pitch, lat.center, lat.universes = (2.5, 6.0), (1.0, -2.0, 4.0), [level_a, level_b]
+    else:
+        lat.pitch, lat.center, lat.universes = (2.5,), (1.0, -2.0), level_a
+    lat.outer = outer
+    world = _world(20.0)
+    can = openmc.ZCylinder(x0=1.0, y0=-2.0, r=6.5)
+    lo, hi = openmc.ZPlane(-2.0), openmc.ZPlane(10.0)
+    region = -can & +lo & -hi
+    cells = [openmc.Cell(name="Lattice", fill=lat, region=region & world),
+             openmc.Cell(name="Outside", region=world & ~region)]
+    settings = openmc.Settings(run_mode="fixed source", particles=1000, batches=5, seed=1)
+    settings.source = openmc.IndependentSource(space=openmc.stats.Point((1.0, -2.0, 4.0)))
+    return openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
+
+
 def export_model(model, work, name):
     d = os.path.join(work, name)
     os.makedirs(d)
@@ -221,6 +255,18 @@ def export_model(model, work, name):
     with contextlib.redirect_stdout(io.StringIO()):
         report = export(os.path.join(d, "model.xml"), d, name, samples=SAMPLES)
     return report
+
+
+def _wrap_card(text, width=78):
+    """One cell card over several lines (continuations start with 5 spaces), as MCNP input requires."""
+    out, line = [], ""
+    for tok in text.split():
+        if line and len(line) + 1 + len(tok) > width:
+            out.append(line)
+            line = "     " + tok
+        else:
+            line = f"{line} {tok}" if line else tok
+    return "\n".join(out + [line])
 
 
 def validate_text(text, model, work):
@@ -343,7 +389,7 @@ def main():
         card = " ".join(l.strip() for l in lines3[li:lj])
 
         def with_card(new_card):
-            return "\n".join(lines3[:li] + [new_card] + lines3[lj:])
+            return "\n".join(lines3[:li] + [_wrap_card(new_card)] + lines3[lj:])
 
         def lat_mutate(desc, text, expect):
             ok, out = validate_text(text, model3, work)
@@ -370,6 +416,49 @@ def main():
         with_trcl = lines3[:]
         with_trcl[ui] = re.sub(r"(\bU \d+)", r"\1 TRCL (0 0 1)", with_trcl[ui], count=1)
         lat_mutate("lattice: TRCL on a unit cell", "\n".join(with_trcl), r"TRCL")
+
+
+        print("5. Hexagonal lattices as MCNP LAT=2 / FILL")
+        hex_reports = {}
+        for name, kw in [("hexy2", {"orientation": "y", "two_levels": True}),
+                         ("hexx1", {"orientation": "x", "two_levels": False})]:
+            r = export_model(hex_lattice_model(**kw), work, name)
+            hex_reports[name] = r
+            text = open(r["runnable"]).read()
+            check(r["ok"], f"{name}: exported deck validates")
+            check("geometry matches OpenMC" in r["validation"], f"{name}: geometry check followed the LAT=2 lattice and matched")
+            check(re.search(r"\bLAT=2\b", text) is not None and "TRCL" not in text.upper(),
+                  f"{name}: LAT=2 card written, no TRCL left from MCNPy")
+
+        baseh = open(hex_reports["hexy2"]["runnable"]).read()
+        modelh = load_model(os.path.join(work, "hexy2", "model.xml"))
+        linesh = baseh.split("\n")
+        hi_ = next(i for i, l in enumerate(linesh) if re.search(r"\bLAT=2\b", l))
+        hj = hi_ + 1
+        while hj < len(linesh) and linesh[hj].startswith("     "):
+            hj += 1
+        hcard = " ".join(l.strip() for l in linesh[hi_:hj])
+        hm = re.match(r"^(\d+ 0 )((?:-?\d+ ){8})", hcard)
+        hsurf = hm.group(2).split()
+
+        def hex_mutate(desc, surf_order, expect):
+            new = hcard.replace(hm.group(0), hm.group(1) + " ".join(surf_order) + " ", 1)
+            text = "\n".join(linesh[:hi_] + [_wrap_card(new)] + linesh[hj:])
+            ok, out = validate_text(text, modelh, work)
+            check(text != baseh and not ok and re.search(expect, out) is not None, f"[{desc}] rejected with /{expect}/")
+            if ok or re.search(expect, out) is None:
+                print("      validator said:\n" + "\n".join("      " + l for l in out.splitlines()[-6:]))
+
+        a = hsurf
+        # swapping one pair also breaks the [-1,1,0] rule, so either reason counts as caught
+        hex_mutate("hex: [0,1,0] and [0,-1,0] faces swapped", [a[0], a[1], a[3], a[2]] + a[4:], r"Geometry:|LAT=2 order")
+        hex_mutate("hex: i and j face pairs swapped", [a[2], a[3], a[0], a[1]] + a[4:], r"Geometry:|LAT=2 order")
+        hex_mutate("hex: axial faces swapped", a[:6] + [a[7], a[6]], r"Geometry:")
+        hex_mutate("hex: 5th face not [-1,1,0]", a[:4] + [a[5], a[4]] + a[6:], r"LAT=2 order")
+        mo = re.search(r"FILL=(\d+) \((\S+) (\S+) (\S+)\)", baseh)
+        moved = baseh.replace(mo.group(0), f"FILL={mo.group(1)} ({mo.group(2)} {float(mo.group(3)) + 0.7} {mo.group(4)})", 1)
+        ok, out = validate_text(moved, modelh, work)
+        check(not ok and "Geometry:" in out, "[hex: FILL origin shifted 0.7 cm in y] rejected by the geometry check")
 
         print("3. Unsupported features are refused")
         try:

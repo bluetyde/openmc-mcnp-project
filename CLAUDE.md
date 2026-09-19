@@ -117,7 +117,11 @@ the installed version instead.
     - `FILL=u`, or an array with i varying fastest (p. 291-292); OpenMC lists rows top first, so y is flipped;
     - `FILL=L (x0 y0 z0)` on the filled cell;
     - MCNPy's TRCL removed from the unit cells.
-    `HexLattice` is refused for now; OpenMC Studio writes hex arrays cell by cell.
+  - `openmc_to_mcnp()` can't translate an `openmc.HexLattice` at all: it crashes with `'NoneType' object is not subscriptable`. `lattice_cards.mcnpy_view()` shows MCNPy a placeholder RectLattice holding the same universes, and only while it translates. `rewrite()` then writes a real `LAT=2` card:
+    - element [0,0,0] is the lattice's centre element (bottom axial level);
+    - its 8 planes are listed [1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [-1,1,0], [1,-1,0], then the two bases (p. 290, 766);
+    - the index steps are two neighbour directions 60 degrees apart;
+    - which universe fills each element is asked from OpenMC's `find_element()`, so OpenMC's ring order doesn't matter.
   - It writes a region-less cell (`openmc.Cell(fill=...)` with no region) as the text `None` and then fails ("Invalid character 'N'"), and it only handles 3D lattices. `lattice_cards.prepare()` runs before translation: it gives such cells a region covering everything, and makes a 2D lattice one z layer 2e9 cm tall. Neither changes the geometry.
   - All of these are remediated programmatically in `remediate_deck.py` (via `make_runnable_deck.py` for the pin cell, or `export_mcnp.py`) and asserted by `validate_deck.py`.
 - Remediation details that are easy to get wrong:
@@ -129,14 +133,16 @@ the installed version instead.
 - MontePy 1.1.3 parses `SDEF` as a `ForbiddenDataInput`: it round-trips the text but can't be edited through the object model. `SI`/`SP`/`F`/`E`/`FM`/`SD`/`FMESH`/`NPS`/`KCODE`/`KSRC` parse as generic `DataInput`.
 - The geometry check is sampling-based evidence, not a proof: small features can be missed.
   - Surfaces: P (4-constant), PX/PY/PZ, SO/S/SX/SY/SZ, CX/CY/CZ, C/X/C/Y/C/Z and GQ.
-  - Universes: it follows FILL (with a translation) and LAT=1 lattices bounded by PX/PY/PZ planes.
-  - TRCL, rotated fills, surface transformations and LAT=2 are reported as "could not run", never silently passed.
+  - Universes: it follows FILL (with a translation), LAT=1 lattices with rectangular elements, and LAT=2 lattices whose 8 faces are in the manual's order. A LAT=2 point goes to the nearest hexagon centre.
+  - TRCL, rotated fills and surface transformations are reported as "could not run", never silently passed.
   - Its lattice rules come from the MCNP 6.3 manual. The writer (`lattice_cards.py`) follows the same reading of it, so the final proof is an MCNP plot or run of a lattice deck (not done yet: no MCNP here).
 - MCNPy's Java bridge (metapy/py4j) always uses port 25333, and there is only one per machine.
   - A second process that imports `mcnpy` attaches to the running bridge instead of starting its own.
   - When the process that started the bridge exits, `atexit` kills it, and the others fail with `ConnectionRefusedError ... 25333`.
   - Run one MCNPy job at a time; OpenMC Studio's own MCNP worker counts as one.
   - Don't use `metapy/java_cleanup.sh`: it kills the most recently started Java process on the machine.
+  - If Java dies on launch (seen after a cold WSL boot), metapy waits forever. Its loop only stops when `sleep_time == 5.0`, and 0.01 s float steps never hit that exactly. OpenMC Studio's server gives up after 180 s; scripts need their own timeout. You can also start `java -jar <metapy>/EntryPoint.jar` yourself first: metapy attaches to it, and you see Java's errors.
+- OpenMC 0.15.3's `Model.from_model_xml()` drops the axial level of a `HexLattice` with `n_axial="1"`. Python's `geometry.find()` then treats it as 2D, but OpenMC's transport code (checked with `openmc.lib.find_cell`) keeps it 3D. `load_model()` repairs this (`lattice_cards.fix_loaded_hex_lattices`), so the geometry check compares against what OpenMC actually runs.
 - No MCNP executable is installed in this environment, so exported decks are validated by MontePy, `validate_deck.py` and the geometry check, but have not been run through MCNP itself.
 - MontePy: `problem.mode` is not included in `write_to_file()` output by
   itself — `_write_to_stream()` only walks `cells`/`surfaces`/`data_inputs`,
