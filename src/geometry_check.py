@@ -90,6 +90,22 @@ def _surface_fn(s):
             gz = 2 * C * z + E * y + F * x + J
             return v, np.sqrt(gx * gx + gy * gy + gz * gz)  # |v| / |grad| ~ distance to the surface
         return gq
+    if t == "RPP" and len(c) == 6:
+        x0, x1, y0, y1, z0, z1 = c
+
+        def rpp(P):
+            dx = np.maximum(np.maximum(x0 - P[:, 0], P[:, 0] - x1), 0.0)
+            dy = np.maximum(np.maximum(y0 - P[:, 1], P[:, 1] - y1), 0.0)
+            dz = np.maximum(np.maximum(z0 - P[:, 2], P[:, 2] - z1), 0.0)
+            dist_out = np.sqrt(dx * dx + dy * dy + dz * dz)
+            dist_in = np.minimum(
+                np.minimum(P[:, 0] - x0, x1 - P[:, 0]),
+                np.minimum(np.minimum(P[:, 1] - y0, y1 - P[:, 1]), np.minimum(P[:, 2] - z0, z1 - P[:, 2])),
+            )
+            v = np.where(dist_out > 0, dist_out, -dist_in)
+            return v, 1.0
+
+        return rpp
     raise NotCheckable(f"surface {s.number} type {t} isn't supported by the geometry check")
 
 
@@ -176,6 +192,20 @@ class _Element:
         leaves = _leaves(cell.geometry)
         if any(l.is_cell for l in leaves):
             raise NotCheckable(f"lattice cell {cell.number} uses a cell complement")
+        if lt == 1 and len(leaves) == 1:
+            leaf = leaves[0]
+            s = surfaces_by_num[leaf.divider.number]
+            if str(s.surface_type).upper() == "RPP":
+                if leaf.side:
+                    raise NotCheckable(f"lattice cell {cell.number}: RPP element must have negative sense (-s)")
+                x0, x1, y0, y1, z0, z1 = [float(v) for v in s.surface_constants]
+                self.pairs = [
+                    (np.array([1.0, 0.0, 0.0]), x1, -x0, np.array([x1 - x0, 0.0, 0.0])),
+                    (np.array([0.0, 1.0, 0.0]), y1, -y0, np.array([0.0, y1 - y0, 0.0])),
+                    (np.array([0.0, 0.0, 1.0]), z1, -z0, np.array([0.0, 0.0, z1 - z0])),
+                ]
+                self.hex = False
+                return
         hs = [_halfspace(l, surfaces_by_num, cell) for l in leaves]
         if lt == 1 and len(hs) not in (4, 6) or lt == 2 and len(hs) not in (6, 8) or lt not in (1, 2):
             raise NotCheckable(f"lattice cell {cell.number}: LAT={lt} with {len(hs)} surfaces")

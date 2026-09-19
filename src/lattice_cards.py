@@ -201,9 +201,11 @@ def _rect_layout(lat, filled):
     u = lat.universes if len(pitch) == 3 else [lat.universes]  # [z][y, top row first][x]
     nz, ny, nx = len(u), len(u[0]), len(u[0][0])
     dims = [nx, ny, nz]
-    planes = []  # +x, -x, +y, -y (, +z, -z) around the origin (p. 290)
-    for axis, p in zip("XYZ", pitch):
-        planes += [(f"P{axis}", (p / 2,), "-"), (f"P{axis}", (-p / 2,), "+")]
+    pz = pitch[2] if len(pitch) == 3 else 2 * FAR
+    # Base element is an RPP macrobody centered on the origin (manual §5.3.4, Listing 5.15, p. 289).
+    # Its facets are in MCNP Table 5.2 order: xmax (+x), xmin (-x), ymax (+y), ymin (-y), zmax (+z), zmin (-z),
+    # matching the element index directions (manual p. 278, 290).
+    planes = [("RPP", (-pitch[0] / 2, pitch[0] / 2, -pitch[1] / 2, pitch[1] / 2, -pz / 2, pz / 2), "-")]
     ll = [float(v) for v in lat.lower_left]
     lo, hi = [0, 0, 0], [nx - 1, ny - 1, nz - 1]
     for c, (blo, bhi) in _filled_bounds(lat, filled):

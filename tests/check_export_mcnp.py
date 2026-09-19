@@ -462,6 +462,8 @@ def main():
             check("geometry matches OpenMC" in r["validation"], f"{name}: geometry check followed the lattice and matched")
             check(re.search(r"\bLAT=1\b", text) is not None and "TRCL" not in text.upper(),
                   f"{name}: LAT=1 card written, no TRCL left from MCNPy")
+            check(re.search(r"\bRPP\b", text) is not None,
+                  f"{name}: RPP macrobody card written for base element")
         text2d = open(lat_reports["lattice2d"]["runnable"]).read()
         check(re.search(r"FILL=-2:2 -2:4 0:0 ", text2d) is not None,
               "lattice2d: FILL ranges -2:2 -2:4 reach past the 2 x 3 array to cover its cell (outer universe there)")
@@ -484,10 +486,15 @@ def main():
             if ok or re.search(expect, out) is None:
                 print("      validator said:\n" + "\n".join("      " + l for l in out.splitlines()[-8:]))
 
-        # 1. the first two surfaces swapped: index i now increases along -x, which mirrors the array
-        m = re.match(r"^(\d+ 0 )(-\d+) (\d+) ", card)
-        lat_mutate("lattice: first two element surfaces swapped", with_card(card.replace(m.group(0), f"{m.group(1)}{m.group(3)} {m.group(2)} ", 1)),
-                   r"Geometry:")
+        # 1. RPP element bounds shifted by 1 cm in x
+        sm = re.search(r"^(\s*\d+\s+RPP\s+)(-?[0-9.]+)\s+(-?[0-9.]+)(\s+.*)", base3, re.MULTILINE)
+        x0, x1 = float(sm.group(2)), float(sm.group(3))
+        shifted_rpp = base3[:sm.start()] + f"{sm.group(1)}{x0 + 1.0} {x1 + 1.0}{sm.group(4)}" + base3[sm.end():]
+        lat_mutate("lattice: RPP element shifted in x", shifted_rpp, r"Geometry:")
+        # 1b. RPP element has positive sense (+s instead of -s)
+        pm = re.match(r"^(\d+ 0 )-(\d+)( .*\bLAT=1\b.*)", card)
+        lat_mutate("lattice: RPP element has positive sense", with_card(f"{pm.group(1)}{pm.group(2)}{pm.group(3)}"),
+                   r"RPP element must have negative sense")
         # 2. the filled cell's FILL origin moved by 1 cm in x
         mo = re.search(r"FILL=(\d+) \((\S+) (\S+) (\S+)\)", base3)
         moved = base3.replace(mo.group(0), f"FILL={mo.group(1)} ({float(mo.group(2)) + 1.0} {mo.group(3)} {mo.group(4)})", 1)
