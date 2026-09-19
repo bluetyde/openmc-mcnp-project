@@ -80,6 +80,15 @@ def _cards_by_name(raw_text):
     return cards
 
 
+def _floats(words):
+    """The words as numbers, or None if any of them isn't one (MCNP allows particle letters and option letters
+    where this reader expects numbers, e.g. 'DS5 L N P' or 'SP4 D 1 3'; those are reported, not crashed on)."""
+    try:
+        return [float(w) for w in words]
+    except ValueError:
+        return None
+
+
 def _close_all(a, b, rel=1e-6):
     return len(a) == len(b) and all(abs(x - y) <= rel * max(1.0, abs(x), abs(y)) for x, y in zip(a, b))
 
@@ -103,8 +112,9 @@ def _check_sources(raw_text, sources):
         return [f"SDEF ERG=D{sel}: SI{sel} must be 'S' with one energy distribution per source ({k}), found {si}."]
     errors = []
     strengths = [float(s.strength) for s in sources]
-    got = [float(v) for v in sp]
-    if len(got) != k or not _close_all([g / sum(got) for g in got], [s / sum(strengths) for s in strengths]):
+    got = _floats(sp[1:] if sp and sp[0] in ("D", "C") else sp)  # SP may carry the D (probabilities) option
+    if (got is None or len(got) != k or sum(got) <= 0 or sum(strengths) <= 0
+            or not _close_all([g / sum(got) for g in got], [s / sum(strengths) for s in strengths])):
         errors.append(f"SP{sel} {sp} doesn't match the OpenMC source strengths {strengths}.")
 
     def dist(n):
@@ -112,8 +122,9 @@ def _check_sources(raw_text, sources):
         si, sp = cards.get(f"SI{n}", []), cards.get(f"SP{n}", [])
         opt = si[0] if si and si[0] in ("H", "L", "A", "S") else ("H" if si else None)
         spopt = sp[0] if sp and sp[0] in ("D", "C") else None
-        return (opt, [float(v) for v in (si[1:] if si and si[0] in ("H", "L", "A", "S") else si)],
-                [float(v) for v in (sp[1:] if spopt else sp)])
+        vals = _floats(si[1:] if si and si[0] in ("H", "L", "A", "S") else si)
+        probs = _floats(sp[1:] if spopt else sp)
+        return opt, (vals if vals is not None else []), (probs if probs is not None else [])
 
     def per_source(key):
         """For each source: ('value', [numbers]) or ('dist', (SI option, SI values, SP values)); None if absent."""
@@ -122,12 +133,19 @@ def _check_sources(raw_text, sources):
             return None
         dm = re.fullmatch(r"FERG=D(\d+)", v)
         if not dm:
-            return [("value", [float(x) for x in v.split()])] * k
+            vals = _floats(v.split())
+            if vals is None:
+                errors.append(f"SDEF {key}={v}: this reader needs numbers there.")
+                return [None] * k
+            return [("value", vals)] * k
         ds = cards.get(f"DS{dm.group(1)}", [])
         if not ds or ds[0] not in ("L", "S"):
             errors.append(f"SDEF {key}={v}: DS{dm.group(1)} must be L or S.")
             return [None] * k
         vals = ds[1:]
+        if ds[0] == "L" and _floats(vals) is None:
+            errors.append(f"DS{dm.group(1)} {' '.join(vals)}: this reader needs numbers there.")
+            return [None] * k
         if len(vals) % k:
             errors.append(f"DS{dm.group(1)} has {len(vals)} entries, not a multiple of the {k} sources.")
             return [None] * k

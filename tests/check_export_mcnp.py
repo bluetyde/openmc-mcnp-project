@@ -806,6 +806,27 @@ def main():
         check(re.search(r"^\s*\d+\s+RPP\b", shared_text, re.M) is None,
               "shared boxes: adjacent boxes sharing face preserved as planes, no invalid RPP conversion")
 
+        # MCNP spells some of these cards in other legal ways; the reader must report, never crash (it used to
+        # raise ValueError on 'SP n D ...' and on particle letters, and divide by zero on zero strengths)
+        ok, out = validate_text(re.sub(rf"^SP{sel} ", f"SP{sel} D ", stext, count=1, flags=re.M), smodel, work)
+        check(ok, "sources: the strengths card with its optional D option still validates")
+        letters = re.sub(rf"^DS{ds_of('PAR')} L .*$", f"DS{ds_of('PAR')} L N P N", stext, count=1, flags=re.M)
+        ok, out = validate_text(letters, smodel, work)
+        check(not ok and "needs numbers" in out, "sources: particle letters on a DS card are reported, not crashed on")
+        zero = re.sub(rf"^SP{sel} .*$", f"SP{sel} 0 0 0", stext, count=1, flags=re.M)
+        ok, out = validate_text(zero, smodel, work)
+        check(not ok and f"SP{sel}" in out, "sources: zero strengths are reported, not divided by")
+
+        from mcnp_cards import MAX_DIST, fixed_source_cards
+        many = openmc.Settings(run_mode="fixed source", particles=10, batches=1)
+        many.source = [openmc.IndependentSource(space=openmc.stats.Point((i, 0.0, 0.0)),
+                                                energy=openmc.stats.Discrete([1e6 + i], [1.0])) for i in range(MAX_DIST + 2)]
+        try:
+            fixed_source_cards(many)
+            check(False, f"sources: more than {MAX_DIST} distributions refused")
+        except UnsupportedFeature as e:
+            check(str(MAX_DIST) in str(e), f"sources: more than {MAX_DIST} distributions refused (MCNP's limit)")
+
         print("3. Unsupported features are refused")
         try:
             export_model(shielding_model(absorption_in_fuel=True), work, "absorb")

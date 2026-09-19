@@ -99,6 +99,9 @@ def _close(a, b, rel=1e-9, abs_tol=1e-12):
     return math.isclose(float(a), float(b), rel_tol=rel, abs_tol=abs_tol)
 
 
+MAX_DIST = 999  # p. 397: SI/SP/SB/DS distribution numbers are 1 to 999
+
+
 class _Dists:
     """Allocates SI/SP distribution numbers."""
 
@@ -106,9 +109,16 @@ class _Dists:
         self.next = start
         self.cards = []
 
-    def add(self, si, sp):
+    def reserve(self):
         n = self.next
+        if n > MAX_DIST:
+            raise UnsupportedFeature(f"This model needs more than {MAX_DIST} SI/SP/DS distributions, which is MCNP's "
+                                     f"limit (manual p. 397). Export fewer sources, or give them fewer distributions.")
         self.next += 1
+        return n
+
+    def add(self, si, sp):
+        n = self.reserve()
         if si is not None:
             self.cards.append(f"SI{n} {si}")
         self.cards.append(f"SP{n} {sp}")
@@ -270,14 +280,12 @@ def _multi_source_sdef(sources):
     for s in sources:
         e = _energy(s.energy, dists)
         energies.append(e[1:] if e.startswith("D") else fixed(e))
-    sel = dists.next
-    dists.next += 1
+    sel = dists.reserve()
     dists.cards.append(f"SI{sel} S " + " ".join(energies))
     dists.cards.append(f"SP{sel} " + " ".join(num(float(s.strength)) for s in sources))
 
     def dep(option, values):
-        n = dists.next
-        dists.next += 1
+        n = dists.reserve()
         dists.cards.append(f"DS{n} {option} " + " ".join(values))
         return f"FERG=D{n}"
 
