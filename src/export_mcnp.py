@@ -44,7 +44,7 @@ def translate(model, out_path, stdout=None):
     return notes
 
 
-def export(model_path, out_dir=None, name=None, sab=None, samples=20000):
+def export(model_path, out_dir=None, name=None, sab=None, samples=20000, macrobodies=True):
     report = {"ok": False, "model": os.path.abspath(model_path), "stage": "load"}
     model = load_model(model_path)
     base = os.path.dirname(os.path.abspath(model_path)) if not os.path.isdir(model_path) else os.path.abspath(model_path)
@@ -59,7 +59,7 @@ def export(model_path, out_dir=None, name=None, sab=None, samples=20000):
     prep_notes = translate(model, translated)
 
     report["stage"] = "remediate"
-    report.update(remediate(translated, model, runnable, sab_map=sab))
+    report.update(remediate(translated, model, runnable, sab_map=sab, simplify_macrobodies=macrobodies))
     report["notes"] = prep_notes + report.get("notes", [])
 
     report["stage"] = "validate"
@@ -80,6 +80,8 @@ def main(argv=None):
     ap.add_argument("--sab", action="append", default=[], metavar="OPENMC_NAME=MCNP_ID",
                     help="override an S(a,b) mapping, e.g. c_H_in_H2O=h-h2o.40t (repeatable)")
     ap.add_argument("--samples", type=int, default=20000, help="geometry check sample points (0 to skip)")
+    ap.add_argument("--no-macrobodies", dest="macrobodies", action="store_false", default=True,
+                    help="disable standalone macrobody simplification (RPP, RCC)")
     ap.add_argument("--report", help="write a JSON report here")
     args = ap.parse_args(argv)
 
@@ -91,7 +93,7 @@ def main(argv=None):
         sab[k.strip()] = v.strip()
 
     try:
-        report = export(args.model, args.out_dir, args.name, sab, args.samples)
+        report = export(args.model, args.out_dir, args.name, sab, args.samples, macrobodies=args.macrobodies)
     except UnsupportedFeature as e:
         report = {"ok": False, "stage": "remediate", "error": f"Not exportable: {e}"}
     except Exception as e:

@@ -335,6 +335,52 @@ def multi_source_model(kind):
     return model
 
 
+def standalone_primitives_model():
+    """Standalone box, standalone z-cylinder, and standalone sphere inside a world box."""
+    openmc.reset_auto_ids()
+    steel, water = _lattice_materials()
+    box_reg = _box((-5.0, -5.0, -5.0), (5.0, 5.0, 5.0))
+    cyl = openmc.ZCylinder(x0=15.0, y0=0.0, r=4.0)
+    top, bottom = openmc.ZPlane(8.0), openmc.ZPlane(-8.0)
+    cyl_reg = -cyl & +bottom & -top
+    sph = openmc.Sphere(x0=-15.0, y0=0.0, z0=0.0, r=4.0)
+    sph_reg = -sph
+    world = _world(30.0)
+
+    cells = [
+        openmc.Cell(name="Box", fill=steel, region=box_reg),
+        openmc.Cell(name="Cyl", fill=water, region=cyl_reg),
+        openmc.Cell(name="Sphere", fill=water, region=sph_reg),
+        openmc.Cell(name="World", region=world & ~box_reg & ~cyl_reg & ~sph_reg),
+    ]
+    settings = openmc.Settings(run_mode="fixed source", particles=1000, batches=5, seed=1)
+    settings.source = openmc.IndependentSource(space=openmc.stats.Point((0, 0, 0)))
+    return openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
+
+
+def shared_face_box_model():
+    """Two adjacent boxes sharing a plane face (x=0). Neither should be collapsed to RPP,
+    preventing face mismatch / boundary corruption."""
+    openmc.reset_auto_ids()
+    steel, water = _lattice_materials()
+    shared_px = openmc.XPlane(0.0)
+    box_a = (+openmc.XPlane(-10.0) & -shared_px &
+             +openmc.YPlane(-5.0) & -openmc.YPlane(5.0) &
+             +openmc.ZPlane(-5.0) & -openmc.ZPlane(5.0))
+    box_b = (+shared_px & -openmc.XPlane(10.0) &
+             +openmc.YPlane(-5.0) & -openmc.YPlane(5.0) &
+             +openmc.ZPlane(-5.0) & -openmc.ZPlane(5.0))
+    world = _world(20.0)
+    cells = [
+        openmc.Cell(name="BoxA", fill=steel, region=box_a),
+        openmc.Cell(name="BoxB", fill=water, region=box_b),
+        openmc.Cell(name="World", region=world & ~box_a & ~box_b),
+    ]
+    settings = openmc.Settings(run_mode="fixed source", particles=1000, batches=5, seed=1)
+    settings.source = openmc.IndependentSource(space=openmc.stats.Point((0, 0, 0)))
+    return openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
+
+
 def export_model(model, work, name):
     d = os.path.join(work, name)
     os.makedirs(d)
@@ -717,6 +763,48 @@ def main():
         src_mutate("radius distributions swapped", swap_groups(f"DS{ds_of('RAD')}", 1), r"Source \d: (radius|a point source needs RAD)")
         src_mutate("particle list changed", lambda t: re.sub(rf"^DS{ds_of('PAR')} L .*$", f"DS{ds_of('PAR')} L 1 1 1", t, count=1, flags=re.M),
                    r"Source 2: MCNP particle")
+
+        print("9. Standalone macrobody simplification (RPP, RCC)")
+        r_prim = export_model(standalone_primitives_model(), work, "primitives")
+        check(r_prim["ok"], "primitives: deck validates")
+        prim_text = open(r_prim["runnable"]).read()
+        check(re.search(r"^\s*\d+\s+RPP\s+-5\.?0*\s+5\.?0*\s+-5\.?0*\s+5\.?0*\s+-5\.?0*\s+5\.?0*", prim_text, re.M) is not None,
+              "primitives: box simplified to RPP card with correct bounds")
+        check(re.search(r"^\s*\d+\s+RCC\s+15\.?0*\s+0\.?0*\s+-8\.?0*\s+0\.?0*\s+0\.?0*\s+16\.?0*\s+4\.?0*", prim_text, re.M) is not None,
+              "primitives: cylinder simplified to RCC card with correct base and height")
+        check("Cell 1: simplified 6 primitive surfaces into RPP" in " ".join(r_prim["notes"]),
+              "primitives: remediation note records box RPP simplification")
+        check("Cell 2: simplified 3 primitive surfaces into RCC" in " ".join(r_prim["notes"]),
+              "primitives: remediation note records cylinder RCC simplification")
+        check("geometry matches OpenMC" in r_prim["validation"], "primitives: geometry check matched OpenMC with 0 lost particles")
+
+        # Mutations for RPP and RCC
+        prim_model = load_model(os.path.join(work, "primitives", "model.xml"))
+
+        def prim_mutate(desc, change, expect):
+            text = change(prim_text)
+            ok, out = validate_text(text, prim_model, work)
+            check(text != prim_text and not ok and re.search(expect, out) is not None, f"[{desc}] rejected with /{expect}/")
+            if ok or re.search(expect, out) is None:
+                print("      validator said:\n" + "\n".join("      " + l for l in out.splitlines()[-6:]))
+
+        # 1. RPP bound perturbed
+        prim_mutate("RPP: xmax shifted from 5 to 6",
+                    lambda t: re.sub(r"(RPP\s+-5\.?0*\s+)5\.?0*", r"\g<1>6.0", t, count=1),
+                    r"Geometry:")
+
+        # 2. RCC radius perturbed
+        prim_mutate("RCC: radius perturbed from 4 to 4.5",
+                    lambda t: re.sub(r"(RCC\s+15\.?0*\s+0\.?0*\s+-8\.?0*\s+0\.?0*\s+0\.?0*\s+16\.?0*\s+)4\.?0*", r"\g<1>4.5", t, count=1),
+                    r"Geometry:")
+
+        # 3. Shared face preservation
+        r_shared = export_model(shared_face_box_model(), work, "shared_boxes")
+        check(r_shared["ok"], "shared boxes: deck validates")
+        shared_text = open(r_shared["runnable"]).read()
+        # Ensure neither box stole the shared plane or converted to RPP
+        check(re.search(r"^\s*\d+\s+RPP\b", shared_text, re.M) is None,
+              "shared boxes: adjacent boxes sharing face preserved as planes, no invalid RPP conversion")
 
         print("3. Unsupported features are refused")
         try:

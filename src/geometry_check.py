@@ -59,10 +59,10 @@ def _surface_fn(s):
     if t in ("PX", "PY", "PZ"):
         i = "XYZ".index(t[1])
         return lambda P: (P[:, i] - c[0], 1.0)
-    if t in ("SO", "S", "SX", "SY", "SZ"):
+    if t in ("SO", "S", "SX", "SY", "SZ", "SPH"):
         if t == "SO":
             ctr, r = (0, 0, 0), c[0]
-        elif t == "S":
+        elif t in ("S", "SPH"):
             ctr, r = c[:3], c[3]
         else:
             ctr = [0.0, 0.0, 0.0]
@@ -106,6 +106,55 @@ def _surface_fn(s):
             return v, 1.0
 
         return rpp
+    if t == "RCC" and len(c) == 7:
+        vx, vy, vz, hx, hy, hz, r = [float(v) for v in c]
+        V = np.array([vx, vy, vz])
+        H = np.array([hx, hy, hz])
+        h_len2 = float(np.dot(H, H))
+        h_len = math.sqrt(h_len2)
+        u = H / h_len
+
+        def rcc(P):
+            w = P - V
+            t_proj = np.dot(w, u)
+            w_perp = w - np.outer(t_proj, u)
+            rho = np.sqrt(np.sum(w_perp ** 2, axis=1))
+
+            d_axial_out = np.maximum(np.maximum(-t_proj, t_proj - h_len), 0.0)
+            d_radial_out = np.maximum(rho - r, 0.0)
+            dist_out = np.sqrt(d_axial_out ** 2 + d_radial_out ** 2)
+
+            dist_in = np.minimum(np.minimum(t_proj, h_len - t_proj), r - rho)
+            v = np.where(dist_out > 0, dist_out, -dist_in)
+            return v, 1.0
+
+        return rcc
+    if t == "BOX" and len(c) == 12:
+        c = [float(v) for v in c]
+        V = np.array(c[0:3])
+        A1 = np.array(c[3:6])
+        A2 = np.array(c[6:9])
+        A3 = np.array(c[9:12])
+        l1, l2, l3 = np.linalg.norm(A1), np.linalg.norm(A2), np.linalg.norm(A3)
+        u1, u2, u3 = A1 / l1, A2 / l2, A3 / l3
+
+        def box_fn(P):
+            w = P - V
+            t1 = np.dot(w, u1)
+            t2 = np.dot(w, u2)
+            t3 = np.dot(w, u3)
+            d1_out = np.maximum(np.maximum(-t1, t1 - l1), 0.0)
+            d2_out = np.maximum(np.maximum(-t2, t2 - l2), 0.0)
+            d3_out = np.maximum(np.maximum(-t3, t3 - l3), 0.0)
+            dist_out = np.sqrt(d1_out ** 2 + d2_out ** 2 + d3_out ** 2)
+            dist_in = np.minimum(
+                np.minimum(t1, l1 - t1),
+                np.minimum(np.minimum(t2, l2 - t2), np.minimum(t3, l3 - t3)),
+            )
+            v = np.where(dist_out > 0, dist_out, -dist_in)
+            return v, 1.0
+
+        return box_fn
     raise NotCheckable(f"surface {s.number} type {t} isn't supported by the geometry check")
 
 

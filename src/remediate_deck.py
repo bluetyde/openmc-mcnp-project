@@ -27,6 +27,7 @@ import openmc
 from montepy.universe import Universe
 
 import lattice_cards
+import macrobody_cards
 import mcnp_cards
 from mcnp_cards import UnsupportedFeature
 from deck_format import format_deck
@@ -79,7 +80,7 @@ def _graveyard_card(number, cell_ids):
     return "\n".join(lines)
 
 
-def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=None):
+def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=None, simplify_macrobodies=True):
     """Write a runnable deck to out_deck. Returns a report dict of what was added."""
     sab = dict(mcnp_cards.SAB_MCNP_MAP)
     sab.update(sab_map or {})
@@ -96,6 +97,10 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
     # 1b. lattices: MCNPy's LAT/FILL cards are rewritten from the OpenMC lattices (src/lattice_cards.py)
     lattice_maps = {}  # lattice id -> MCNP LAT cell and index map, for tally chains
     report["notes"] += lattice_cards.rewrite(blocks, model, lattice_maps)
+
+    # 1c. macrobodies: simplify standalone primitives (box -> RPP, cylinder -> RCC)
+    if simplify_macrobodies:
+        report["notes"] += macrobody_cards.simplify_cells(blocks, model)
 
     # 2. graveyard cell for vacuum boundaries (inserted at the end of the cell block)
     vac = vacuum_surfaces(geometry)
@@ -257,6 +262,8 @@ def decorate_deck(text, model, graveyard_id=None):
                 stype = type(s).__name__
                 sname = getattr(s, "name", "")
                 sname_str = f" {sname}" if sname else ""
+                if len(parts) > 1 and parts[1].upper() in ("RPP", "RCC", "SPH", "BOX"):
+                    stype = f"{parts[1].upper()} Macrobody"
                 new_b1.append(f"c --- Surface {sid}:{sname_str} ({stype}) ---")
         new_b1.append(line)
 
