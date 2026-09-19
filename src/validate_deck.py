@@ -214,7 +214,13 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
                           f"particles leaving the model would be lost.")
 
         # 6. tallies; chain bins (cells inside lattices) are checked against OpenMC's instances in step 7
-        expected = sum(len(t.scores) for t in (model.tallies or []))
+        from mcnp_cards import current_bins
+        expected = 0
+        for t in model.tallies or []:
+            if any(isinstance(f, openmc.SurfaceFilter) for f in t.filters):
+                expected += len(current_bins(t, model.geometry)[0])  # one F1 per (surface, cell) bin that can score
+            else:
+                expected += len(t.scores)
         found_tallies = _tally_card_texts(raw_text)
         if len(found_tallies) != expected:
             errors.append(f"Expected {expected} tallies (one per OpenMC tally score) but found {len(found_tallies)}.")
@@ -222,6 +228,9 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
         card_bins = []
         for head, rest in found_tallies:
             bins = None
+            if head.startswith("F") and head.split(":")[0][-1:] == "1" and ":" in head:  # F1: surfaces, not cells
+                card_bins.append((head, None))
+                continue
             if not head.startswith("FMESH") and ":" in head:
                 try:
                     bins = _tally_bins(rest)
@@ -236,13 +245,52 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
                 if not_lat:
                     errors.append(f"{head} gives lattice indices for cells {not_lat}, which aren't lattice cells.")
             card_bins.append((head, bins))
+        # current tallies: F1 on an OpenMC surface, C n 0 1, and the FC tag saying where OpenMC's value is
+        faces = []
+        surf_numbers = {s.number for s in problem.surfaces}
+        current_pairs = set()
+        for t in model.tallies or []:
+            if any(isinstance(f, openmc.SurfaceFilter) for f in t.filters):
+                current_pairs |= {(s.id if s is not None else None, c.id if c is not None else None)
+                                  for s, c in current_bins(t, model.geometry)[0]}
+        for head, rest in found_tallies:
+            name = head.split(":")[0]
+            if not (name[1:].isdigit() and name.endswith("1")):
+                continue
+            n = name[1:]
+            words = rest.split()
+            f1 = int(words[0]) if len(words) == 1 and words[0].isdigit() else None
+            if f1 is None or f1 not in surf_numbers:
+                errors.append(f"{head} must name one surface of the deck (found '{rest}').")
+                continue
+            fc = re.search(rf"^FC{n}\s.*\[S (\d+) (?:C (\d+) SEG (\d+)(?:-(\d+))? COS ([12]) X([+-]1)|NET)\]\s*$", raw_text, re.M)
+            if fc is None:
+                errors.append(f"{head}: no FC{n} card saying which bin holds OpenMC's value ([S s C c SEG a-b COS n X+1] or [S s NET]).")
+                continue
+            if not re.search(rf"^C{n}\s+0\s+1\s*$", raw_text, re.M):
+                errors.append(f"{head}: needs the cosine card 'C{n} 0 1' to separate the two directions.")
+            sid, cid = int(fc.group(1)), int(fc.group(2)) if fc.group(2) else None
+            if (sid, cid) not in current_pairs:
+                errors.append(f"{head}: no OpenMC current tally has the bin (surface {sid}, cell {cid}).")
+                continue
+            fsm = re.search(rf"^FS{n}\s+((?:.*\n?)(?:^\s+.*\n?)*)", raw_text, re.M)
+            fs = [(abs(int(w)), -1 if w.startswith("-") else 1) for w in (fsm.group(1).split() if fsm else [])]
+            if cid is None:
+                faces.append((f"{head} (net current on surface {sid})", f1, sid, None, [], [], 0, 0))
+            else:
+                a = int(fc.group(3))
+                segs = list(range(a, int(fc.group(4) or a) + 1))
+                faces.append((f"{head} (surface {sid} leaving cell {cid})", f1, sid, cid, fs, segs,
+                              int(fc.group(5)), int(fc.group(6))))
+
         chains = []
         if len(found_tallies) == expected:
             cards_iter = iter(card_bins)
             all_cells, pathed = model.geometry.get_all_cells(), False
             for t in model.tallies or []:
                 inst = next((f for f in t.filters if isinstance(f, openmc.CellInstanceFilter)), None)
-                for _score in t.scores:
+                current = any(isinstance(f, openmc.SurfaceFilter) for f in t.filters)
+                for _card in range(len(current_bins(t, model.geometry)[0]) if current else len(t.scores)):
                     head, bins = next(cards_iter)
                     if inst is None or bins is None:
                         continue
@@ -282,6 +330,16 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
                     print(f"WARNING: {label}: no sampled point fell in it, so it wasn't compared with OpenMC.")
         elif chains:
             print("WARNING: lattice tally bins weren't compared with OpenMC (run with geometry samples to check them).")
+        if geometry_samples and faces:
+            from geometry_check import check_current_faces
+            cf = check_current_faces(problem, model.geometry, faces)
+            if cf["reason"]:
+                errors.append(f"Current tally check could not run: {cf['reason']}.")
+            elif cf["errors"]:
+                errors.extend(f"Current tally: {e}" for e in cf["errors"])
+            else:
+                passed.append(f"{len(faces)} current tallies: F1 surface, FS face and direction match OpenMC at "
+                              f"{cf['checked']} points on the surfaces")
 
     if errors:
         print(f"Validation FAILED with {len(errors)} error(s):")

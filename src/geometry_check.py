@@ -338,6 +338,130 @@ class _Deck:
         return out
 
 
+def _on_surface(s, P, iters=30):
+    """Newton-project points onto OpenMC surface s (any type, via evaluate()); returns the points that converged."""
+    out = []
+    for p in P:
+        x = np.array(p, dtype=float)
+        for _ in range(iters):
+            f = s.evaluate(x)
+            g = np.array([(s.evaluate(x + h) - s.evaluate(x - h)) / 2e-6 for h in np.eye(3) * 1e-6])
+            gg = float(g @ g)
+            if gg < 1e-24:
+                break
+            x = x - f * g / gg
+            if abs(f) / math.sqrt(gg) < 1e-10:
+                out.append((x, g / math.sqrt(gg)))
+                break
+    return out
+
+
+def check_current_faces(problem, geometry, faces, n_points=600, seed=4321):
+    """Check the F1 + FS + C cards of current tallies against OpenMC.
+
+    `faces` = [(label, F1 surface number, OpenMC surface id, OpenMC cell id or None, [(FS surface number, sign)],
+    face segments, cosine bin, sign)]. Points are put on the OpenMC surface (around the cell and over the whole
+    model), and at each one:
+      - the deck's F1 surface must pass through it (the F1 is on the same surface as OpenMC's bin);
+      - OpenMC says whether the cell is just across the surface there (a small step to each side) and on which
+        side; MCNP's FS card, read from the deck's surfaces, gives the segment; the point must be in one of the
+        FS segments declared for the face exactly when OpenMC has the cell there;
+      - the cell's side must match the declared cosine bin (2 = leaving towards the positive side) and sign.
+    Returns dict(errors, reason, checked)."""
+    result = {"errors": [], "reason": None, "checked": 0}
+    try:
+        surfs = {s.number: s for s in problem.surfaces}
+        fns = {}
+
+        def fn(num):
+            if num not in fns:
+                fns[num] = _surface_fn(surfs[num])
+            return fns[num]
+    except NotCheckable as e:
+        result["reason"] = str(e)
+        return result
+    rng = np.random.default_rng(seed)
+    has_vacuum = any(s.boundary_type == "vacuum" for s in geometry.get_all_surfaces().values())
+    dlo, dhi = _domain(geometry, has_vacuum)
+    all_s, all_c = geometry.get_all_surfaces(), geometry.get_all_cells()
+    errors = []
+
+    def add(msg):
+        if len(errors) < 20:
+            errors.append(msg)
+
+    def in_cell(found, cid):
+        return any(isinstance(x, openmc.Cell) and x.id == cid for x in found)
+
+    for label, f1, sid, cid, fs, segs, cos_bin, sign in faces:
+        s = all_s.get(sid)
+        if s is None or f1 not in surfs or any(n not in surfs for n, _ in fs):
+            add(f"{label}: its surfaces aren't all in the deck and the OpenMC model")
+            continue
+        try:
+            fn(f1)
+            for n, _ in fs:
+                fn(n)
+        except NotCheckable as e:
+            add(f"{label}: can't evaluate its surfaces ({e})")
+            continue
+        lo, hi = dlo, dhi
+        if cid is not None and all_c[cid].region is not None:
+            clo, chi = (np.array(v, dtype=float) for v in all_c[cid].region.bounding_box)
+            pad = np.where(np.isfinite(chi - clo), 0.2 * (chi - clo), 0.0)
+            lo, hi = np.maximum(np.nan_to_num(clo - pad, neginf=-np.inf), dlo), np.minimum(np.nan_to_num(chi + pad, posinf=np.inf), dhi)
+        starts = np.vstack([rng.uniform(lo, hi, size=(n_points * 2 // 3, 3)), rng.uniform(dlo, dhi, size=(n_points // 3, 3))])
+        pts = [(x, nrm) for x, nrm in _on_surface(s, starts) if np.all(x >= dlo - 1e-9) and np.all(x <= dhi + 1e-9)]
+        if not pts:
+            add(f"{label}: no point on surface {sid} inside the model")
+            continue
+        X = np.array([p for p, _ in pts])
+        v, scale = fn(f1)(X)
+        off = np.abs(v) / np.maximum(scale, 1e-12) > 1e-6
+        if off.any():
+            add(f"{label}: the F1 surface {f1} isn't OpenMC surface {sid} (point {tuple(np.round(X[off][0], 4))} is on "
+                f"{sid} but not on {f1})")
+            continue
+        if cid is None:
+            result["checked"] += len(X)
+            continue
+        senses = []
+        for n, sgn in fs:
+            val, sc = fn(n)(X)
+            senses.append(((val, np.broadcast_to(sc, val.shape)), sgn))  # planes give one scale for all points
+        hit = 0
+        for i, (x, nrm) in enumerate(pts):
+            if any(abs(val[i]) / max(sc[i], 1e-12) < 1e-6 for (val, sc), _ in senses):
+                continue  # on a segmenting surface: which segment is ambiguous
+            eps = 1e-5
+            up, down = in_cell(geometry.find(tuple(x + eps * nrm)), cid), in_cell(geometry.find(tuple(x - eps * nrm)), cid)
+            if up and down:
+                add(f"{label}: cell {cid} is on both sides of surface {sid} at {tuple(np.round(x, 4))}")
+                break
+            seg = len(fs) + 1
+            for k, ((val, _), sgn) in enumerate(senses):
+                if (val[i] < 0) == (sgn < 0):
+                    seg = k + 1
+                    break
+            face = up or down
+            if face != (seg in segs):
+                add(f"{label}: at {tuple(np.round(x, 4))} OpenMC has cell {cid} {'across' if face else 'not across'} "
+                    f"surface {sid}, but the FS card puts the point in segment {seg} (face segments {segs})")
+                break
+            if face:
+                hit += 1
+                want = (1, -1) if up else (2, 1)  # cell on the positive side: leaving means moving to the negative side
+                if (cos_bin, sign) != want:
+                    add(f"{label}: cell {cid} is on the {'positive' if up else 'negative'} side of surface {sid}, so "
+                        f"leaving it is cosine bin {want[0]} with sign {want[1]:+d}, not bin {cos_bin} x{sign:+d}")
+                    break
+            result["checked"] += 1
+        if not hit and not any(e.startswith(label) for e in errors):
+            add(f"{label}: no sampled point on surface {sid} is next to cell {cid}")
+    result["errors"] = errors
+    return result
+
+
 def _domain(geometry, has_vacuum):
     lo, hi = geometry.bounding_box
     lo, hi = np.array(lo, dtype=float), np.array(hi, dtype=float)

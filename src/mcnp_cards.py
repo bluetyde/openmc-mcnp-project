@@ -366,6 +366,195 @@ def _bin_card(head, bins, width=78):
     return "\n".join(lines + [line])
 
 
+def _flip(side):
+    return "-" if side == "+" else "+"
+
+
+def _literals(region):
+    """A cell region as (literals, carved): literals [(surface, side)] that are all ANDed, and carved, a list of
+    convex shapes (each a literal list) subtracted from it, as Studio writes `shape & world & ~(a | b)`.
+    None if the region has a union that isn't under a complement."""
+    if region is None:
+        return [], []
+    if isinstance(region, openmc.Halfspace):
+        return [(region.surface, region.side)], []
+    if isinstance(region, openmc.Intersection):
+        lits, carved = [], []
+        for r in region:
+            sub = _literals(r)
+            if sub is None:
+                return None
+            lits += sub[0]
+            carved += sub[1]
+        return lits, carved
+    if isinstance(region, openmc.Complement):
+        inner = region.node
+        if isinstance(inner, openmc.Halfspace):
+            return [(inner.surface, _flip(inner.side))], []
+        if isinstance(inner, openmc.Complement):
+            return _literals(inner.node)
+        if isinstance(inner, openmc.Union):  # ~(a | b) = ~a & ~b
+            return _literals(openmc.Intersection([openmc.Complement(r) for r in inner]))
+        sub = _literals(inner)
+        if sub is None or sub[1]:
+            return None
+        return [], [sub[0]]
+    if isinstance(region, openmc.Union):  # a union of half-spaces is a convex shape carved out: a | b = ~(~a & ~b)
+        halves = _union_halfspaces(region)
+        if halves is not None:
+            return [], [[(s, _flip(sd)) for s, sd in halves]]
+    return None
+
+
+def _union_halfspaces(region):
+    """[(surface, side)] if the region is a union of half-spaces (OpenMC writes ~(box) this way), else None."""
+    if isinstance(region, openmc.Halfspace):
+        return [(region.surface, region.side)]
+    if isinstance(region, openmc.Complement) and isinstance(region.node, openmc.Halfspace):
+        return [(region.node.surface, _flip(region.node.side))]
+    if isinstance(region, openmc.Union):
+        out = []
+        for r in region:
+            sub = _union_halfspaces(r)
+            if sub is None:
+                return None
+            out += sub
+        return out
+    return None
+
+
+def _box(lits):
+    return openmc.Intersection([+s if sd == "+" else -s for s, sd in lits]).bounding_box
+
+
+def _boxes_meet(a, b, tol=1e-9):
+    return all(a[0][k] <= b[1][k] + tol and b[0][k] <= a[1][k] + tol for k in range(3))
+
+
+def _current_patch(t, s, c):
+    """How MCNP picks out the crossings OpenMC counts in bin (surface s, CellFromFilter cell c).
+
+    OpenMC scores every crossing of s by a particle that was in c, +1 towards s's positive side and -1 towards
+    its negative side. When c lies on one side of s (its region has s as an ANDed half-space), those are the
+    particles leaving c through its face on s. MCNP's F1 counts crossings of all of s in both directions
+    (manual p. 119, 460), so the face is cut out with FS and the direction with C 0 1 (p. 459-460, 474-475):
+    FS lists the complement of each of c's other half-spaces, so segment K+1 is the face. A carved-out shape
+    (an earlier Studio part) that reaches the face adds its complemented half-spaces too, and the face is then
+    the sum of those segments. Returns (fs literals, face segments, cosine bin, sign), or None when s doesn't
+    bound c (the bin is always 0)."""
+    where = f"Tally '{t.name}': surface {s.id} leaving cell {c.id} ({c.name})"
+    flat = _literals(c.region)
+    if flat is None:
+        raise UnsupportedFeature(f"{where}: the cell's region has a union, so its face on the surface can't be "
+                                 f"cut out with an FS card.")
+    lits, carved = flat
+    sides = {sd for surf, sd in lits if surf.id == s.id}
+    in_carved = any(surf.id == s.id for shape in carved for surf, _ in shape)
+    if not sides:
+        if in_carved:
+            raise UnsupportedFeature(
+                f"{where}: the surface belongs to a part carved out of this cell, so the cell lies on both sides "
+                f"of it and OpenMC counts crossings of the whole surface inside the cell. MCNP can't reproduce "
+                f"that; tally these parts in separate surface tallies.")
+        return None
+    if len(sides) > 1:
+        raise UnsupportedFeature(f"{where}: the cell uses both sides of the surface.")
+    side = sides.pop()
+    others, seen = [], set()
+    for surf, sd in lits:
+        if surf.id != s.id and (surf.id, sd) not in seen:
+            seen.add((surf.id, sd))
+            others.append((surf, sd))
+    lo, hi = (list(v) for v in _box(others + [(s, side)]))
+    axis = {openmc.XPlane: (0, "x0"), openmc.YPlane: (1, "y0"), openmc.ZPlane: (2, "z0")}.get(type(s))
+    if axis:  # an axis plane's face is flat along its axis
+        lo[axis[0]] = hi[axis[0]] = getattr(s, axis[1])
+    touching = []
+    for shape in carved:
+        own = [sd for surf, sd in shape if surf.id == s.id]
+        if own and own[0] != side:
+            continue  # the carved part sits across the surface: it borders the face but doesn't cut it
+        rest = [(surf, sd) for surf, sd in shape if surf.id != s.id]
+        if not rest:
+            raise UnsupportedFeature(f"{where}: a carved-out part covers the whole face.")
+        if _boxes_meet((lo, hi), _box(rest)):
+            touching.append(rest)
+    if len(touching) > 1:
+        raise UnsupportedFeature(f"{where}: {len(touching)} other parts cut into this face; the FS card can "
+                                 f"exclude only one.")
+    fs = [(surf, _flip(sd)) for surf, sd in others]
+    segs = [len(fs) + 1]
+    if touching:
+        fs += [(surf, _flip(sd)) for surf, sd in touching[0]]
+        segs = list(range(segs[0], len(fs) + 1))
+    cos_bin, sign = (2, 1) if side == "-" else (1, -1)
+    return fs, segs, cos_bin, sign
+
+
+def current_bins(t, geometry):
+    """The (surface, cell or None) pairs of a current tally that get an MCNP tally, in order, and those that are
+    always 0 in OpenMC (the surface doesn't bound the cell)."""
+    surf_f = next(f for f in t.filters if isinstance(f, openmc.SurfaceFilter))
+    from_f = next((f for f in t.filters if isinstance(f, openmc.CellFromFilter)), None)
+    surfaces, cells = geometry.get_all_surfaces(), geometry.get_all_cells()
+    pairs, zero = [], []
+    for sid in surf_f.bins:
+        for cid in (from_f.bins if from_f is not None else [None]):
+            c = cells.get(int(cid)) if cid is not None else None
+            if c is not None and int(sid) not in (c.region.get_surfaces() if c.region is not None else {}):
+                zero.append((int(sid), c.id))
+            else:
+                pairs.append((surfaces.get(int(sid)), c))
+    return pairs, zero
+
+
+def _current_cards(t, geometry, e_card, k, notes):
+    """F1 + FC + C + FS (+ E) per bin of a current tally. The FC card ends with a tag the validator reads:
+    [S s C c SEG a-b COS n X+1] = OpenMC's value is the sum of FS segments a-b in cosine bin n, times +1;
+    [S s NET] = cosine bin 2 minus bin 1 (a SurfaceFilter with no CellFromFilter). Returns (cards, next k)."""
+    name = t.name or f"tally {t.id}"
+    pairs, zero = current_bins(t, geometry)
+    out = []
+    for s, c in pairs:
+        if s is None:
+            raise UnsupportedFeature(f"Tally '{name}' refers to a surface that isn't in the geometry.")
+        if s.boundary_type in ("reflective", "periodic", "white"):
+            raise UnsupportedFeature(f"Tally '{name}': surface {s.id} is {s.boundary_type}; current tallies on it "
+                                     f"aren't exported (MCNP and OpenMC count reflected crossings differently).")
+        patch = _current_patch(t, s, c) if c is not None else None
+        n = 10 * k + 1
+        k += 1
+        if c is None:
+            tag = f"[S {s.id} NET]"
+        else:
+            fs, segs, cos_bin, sign = patch
+            seg = f"{segs[0]}-{segs[-1]}" if len(segs) > 1 else str(segs[0])
+            tag = f"[S {s.id} C {c.id} SEG {seg} COS {cos_bin} X{sign:+d}]"
+        out += [f"F{n}:N {s.id}", f"FC{n} {name[:78 - 7 - len(tag)]} {tag}", f"C{n} 0 1"]
+        if c is not None and fs:
+            out.append(_bin_card(f"FS{n}", [("-" if sd == "-" else "") + str(surf.id) for surf, sd in fs]))
+        if e_card:
+            out.append(f"E{n} {e_card}")
+    notes.append(f"Tally '{name}': one MCNP F1 per (surface, part) bin. F1 counts crossings without a sign, so each "
+                 f"FC card ends with where OpenMC's value is: [S s C c SEG a-b COS n X+1] = the sum of FS segments "
+                 f"a-b in cosine bin n (1 = towards the surface's negative side, 2 = positive) times the sign; "
+                 f"[S s NET] = cosine bin 2 minus bin 1.")
+    if zero:
+        notes.append(f"Tally '{name}': (surface, cell) bins {zero} are always 0 in OpenMC (the surface doesn't "
+                     f"bound that cell), so they have no MCNP tally.")
+    return out, k
+
+
+def _e_card(t, energy_f, notes):
+    if energy_f is None:
+        return None
+    edges = [float(e) for e in energy_f.values]
+    if edges[0] > 0:
+        notes.append(f"Tally '{t.name}': MCNP energy bins start at 0, so there is an extra "
+                     f"bin below {edges[0]:g} eV that OpenMC doesn't have.")
+    return " ".join(num(e / 1e6) for e in edges[1:])
+
+
 def tally_cards(tallies, geometry, materials=None, detector_responses=None, lattices=None):
     """F4/E4/FM/SD for cell tallies and FMESH for regular-mesh tallies.
 
@@ -381,7 +570,7 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
     for t in tallies or []:
         if t.nuclides and list(t.nuclides) != ["total"]:
             raise UnsupportedFeature(f"Tally '{t.name}': per-nuclide tallies aren't supported.")
-        cell_f = inst_f = energy_f = mesh_f = energy_fn_f = None
+        cell_f = inst_f = energy_f = mesh_f = energy_fn_f = surf_f = from_f = None
         for f in t.filters:
             if isinstance(f, openmc.CellFilter):
                 cell_f = f
@@ -395,12 +584,21 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
                 pass
             elif isinstance(f, openmc.EnergyFunctionFilter):
                 energy_fn_f = f
-            elif isinstance(f, (openmc.SurfaceFilter, openmc.CellFromFilter)):
-                raise UnsupportedFeature(f"Tally '{t.name}': surface current tallies aren't exported to MCNP yet "
-                                         f"(MCNP F1 counts crossings anywhere on a surface, not only on one cell's face). "
-                                         f"Remove the tally to export the rest.")
+            elif isinstance(f, openmc.SurfaceFilter):
+                surf_f = f
+            elif isinstance(f, openmc.CellFromFilter):
+                from_f = f
             else:
                 raise UnsupportedFeature(f"Tally '{t.name}': {type(f).__name__} isn't supported.")
+        if surf_f is not None or from_f is not None or "current" in t.scores:
+            if surf_f is None or any(f is not None for f in (cell_f, inst_f, mesh_f, energy_fn_f)) or \
+                    list(t.scores) != ["current"]:
+                raise UnsupportedFeature(f"Tally '{t.name}': a current tally needs a SurfaceFilter (a CellFromFilter "
+                                         f"and an EnergyFilter are optional), only the score 'current', and no cell, "
+                                         f"mesh or detector filter.")
+            new, k = _current_cards(t, geometry, _e_card(t, energy_f, notes), k, notes)
+            cards += new
+            continue
         if sum(f is not None for f in (cell_f, inst_f, mesh_f)) != 1:
             raise UnsupportedFeature(f"Tally '{t.name}': needs exactly one CellFilter, CellInstanceFilter or MeshFilter.")
         bins = None  # [(MCNP bin text, openmc cell)]
@@ -413,13 +611,7 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
         elif inst_f is not None:
             bins = _instance_bins(t, inst_f, geometry, lattices)
 
-        e_card = None
-        if energy_f is not None:
-            edges = [float(e) for e in energy_f.values]
-            e_card = " ".join(num(e / 1e6) for e in edges[1:])
-            if edges[0] > 0:
-                notes.append(f"Tally '{t.name}': MCNP energy bins start at 0, so there is an extra "
-                             f"bin below {edges[0]:g} eV that OpenMC doesn't have.")
+        e_card = _e_card(t, energy_f, notes)
 
         for score in t.scores:
             n = 10 * k + 4

@@ -12,6 +12,9 @@ Self-test for src/export_mcnp.py and src/validate_deck.py.
 5. Does the same for hexagonal lattices (LAT=2), in both orientations, with face-order mistakes.
 6. Exports tallies on cells inside lattice elements (CellInstanceFilter) as MCNP chains (c < L[i j k] < c0),
    rectangular and hexagonal, and breaks them (wrong element index, wrong cell, a missing bin).
+7. Exports surface currents (SurfaceFilter x CellFromFilter, as OpenMC Studio writes them) as F1 + C + FS
+   tallies, including a face cut by another part and a net current, refuses what MCNP can't match, and
+   breaks the cards (FS sign, FS surface, direction, F1 surface, C card).
 
 Run from the project root, in the openmc-mcnp env:
     python tests/check_export_mcnp.py
@@ -265,6 +268,33 @@ def lattice_tally_model(kind):
     return model
 
 
+def current_model():
+    """Parts as OpenMC Studio writes them: box E (listed first) cuts into the +x face of box A; sphere B stands
+    apart; World is the rest. Tally 'current out' is the current leaving A and B through their own surfaces
+    (every surface x every part, with energy bins); tally 'net B' is the net current through B's sphere."""
+    openmc.reset_auto_ids()
+    steel, water = _lattice_materials()
+    world = _world(20.0)
+    E, A = _box((4.0, -2.0, -2.0), (8.0, 2.0, 2.0)), _box((-5.0, -5.0, -5.0), (5.0, 5.0, 5.0))
+    sphere = openmc.Sphere(x0=12.0, y0=10.0, z0=0.0, r=3.0)
+    cells = [openmc.Cell(name="E", fill=steel, region=E & world),
+             openmc.Cell(name="A", fill=water, region=A & world & ~E),
+             openmc.Cell(name="B", fill=steel, region=-sphere & world)]
+    cells.append(openmc.Cell(name="World", region=world & ~(E | A | -sphere)))
+    out = openmc.Tally(name="current out")
+    out.filters = [openmc.SurfaceFilter([h.surface for h in A] + [sphere]),
+                   openmc.CellFromFilter([cells[1], cells[2]]), openmc.EnergyFilter([1e-5, 1e5, 2e7])]
+    out.scores = ["current"]
+    net = openmc.Tally(name="net B")
+    net.filters = [openmc.SurfaceFilter([sphere])]
+    net.scores = ["current"]
+    settings = openmc.Settings(run_mode="fixed source", particles=1000, batches=5, seed=1)
+    settings.source = openmc.IndependentSource(space=openmc.stats.Point((0.0, 0.0, 0.0)))
+    model = openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
+    model.tallies = openmc.Tallies([out, net])
+    return model
+
+
 def export_model(model, work, name):
     d = os.path.join(work, name)
     os.makedirs(d)
@@ -512,6 +542,84 @@ def main():
         tally_mutate("rect", "last bin dropped", lambda card: card[:card.rindex("(")].rstrip(), r"has 2 bins but")
         tally_mutate("rect", "lattice index on a cell that isn't a lattice",
                      lambda card: re.sub(r"< (\d+)\)", r"< \1[0 0 0])", card, count=1), r"aren't lattice cells")
+
+        print("7. Surface currents as MCNP F1 + C + FS")
+        r = export_model(current_model(), work, "current")
+        ctext = open(r["runnable"]).read()
+        cmodel = load_model(os.path.join(work, "current", "model.xml"))
+        check(r["ok"], "current: deck with F1/C/FS current tallies validates")
+        check("current tallies: F1 surface, FS face and direction match OpenMC" in r["validation"],
+              "current: the face check compared every F1 with OpenMC")
+        f1s = re.findall(r"^F(\d*1):N (\d+)$", ctext, re.M)
+        check(len(f1s) == 8, f"current: 8 F1 tallies (A's 6 faces, B's sphere, the net current); found {len(f1s)}")
+        check(len(re.findall(r"^C\d*1 0 1$", ctext, re.M)) == 8 and len(re.findall(r"^E\d*1 ", ctext, re.M)) == 7,
+              "current: a C 0 1 card on each, E cards on the 7 with energy bins")
+        cut = re.search(r"^FC(\d+) .*\[S (\d+) C (\d+) SEG (\d+)-(\d+) COS (\d) X([+-]1)\]$", ctext, re.M)
+        check(cut is not None, "current: A's +x face (cut by E) is the sum of several FS segments")
+        check(re.search(r"\[S \d+ NET\]", ctext) is not None, "current: net current tagged [S s NET]")
+        check(any("always 0 in OpenMC" in n for n in r.get("notes", [])), "current: bins that can't score are named in a note")
+
+        def cur_mutate(desc, change, expect):
+            text = change(ctext)
+            ok, out = validate_text(text, cmodel, work)
+            check(text != ctext and not ok and re.search(expect, out) is not None, f"[current: {desc}] rejected with /{expect}/")
+            if ok or re.search(expect, out) is None:
+                print("      validator said:\n" + "\n".join("      " + l for l in out.splitlines()[-6:]))
+
+        n_cut = cut.group(1)
+        plain = re.search(r"^FC(\d+) .*\[S (\d+) C \d+ SEG \d+ COS (\d) X([+-]1)\]$", ctext, re.M)
+        n_pl = plain.group(1)
+
+        def edit_card(text, prefix, fn):
+            return re.sub(rf"^{prefix} (.*)$", lambda m: f"{prefix} " + fn(m.group(1)), text, count=1, flags=re.M)
+
+        def flip_first(words):
+            w = words.split()
+            w[0] = w[0][1:] if w[0].startswith("-") else "-" + w[0]
+            return " ".join(w)
+        cur_mutate("first FS sign flipped on the cut face", lambda t: edit_card(t, f"FS{n_cut}", flip_first), r"FS card puts")
+        cur_mutate("an FS surface dropped", lambda t: edit_card(t, f"FS{n_pl}", lambda w: " ".join(w.split()[:1] + w.split()[2:])),
+                   r"FS card puts")
+        swapped = "COS 1 X-1" if plain.group(3) == "2" else "COS 2 X+1"
+        cur_mutate("direction swapped in the FC tag", lambda t: re.sub(rf"^(FC{n_pl} .*)COS \d X[+-]1", rf"\g<1>{swapped}", t, count=1, flags=re.M),
+                   r"so leaving it is cosine bin")
+        other = next(s for f, s in f1s if s != plain.group(2))
+        cur_mutate("F1 on another surface", lambda t: re.sub(rf"^F{n_pl}:N \d+$", f"F{n_pl}:N {other}", t, count=1, flags=re.M),
+                   r"isn't OpenMC surface")
+        cur_mutate("C card removed", lambda t: re.sub(rf"^C{n_pl} 0 1\n", "", t, count=1, flags=re.M), r"needs the cosine card")
+
+        m = current_model()
+        cells = {c.name: c for c in m.geometry.get_all_cells().values()}
+        e_plane = next(iter(cells["E"].region.get_surfaces().values()))
+        bad = openmc.Tally(name="E plane from A")
+        bad.filters = [openmc.SurfaceFilter([e_plane]), openmc.CellFromFilter([cells["A"]])]
+        bad.scores = ["current"]
+        m.tallies = openmc.Tallies([bad])
+        try:
+            export_model(m, work, "cur_both")
+            check(False, "current: a surface of a part carved out of the cell refused")
+        except UnsupportedFeature as e:
+            check("both sides" in str(e), "current: a surface of a part carved out of the cell refused (cell on both sides)")
+        m = current_model()
+        world_plane = next(s for s in m.geometry.get_all_surfaces().values() if s.boundary_type == "vacuum")
+        world_plane.boundary_type = "reflective"
+        refl = openmc.Tally(name="reflective")
+        refl.filters = [openmc.SurfaceFilter([world_plane]),
+                        openmc.CellFromFilter([next(c for c in m.geometry.get_all_cells().values() if c.name == "World")])]
+        refl.scores = ["current"]
+        m.tallies = openmc.Tallies([refl])
+        try:
+            export_model(m, work, "cur_refl")
+            check(False, "current: a reflective surface refused")
+        except UnsupportedFeature as e:
+            check("reflective" in str(e), "current: a reflective surface refused")
+        m = current_model()
+        m.tallies[0].scores = ["current", "flux"]
+        try:
+            export_model(m, work, "cur_flux")
+            check(False, "current: current mixed with another score refused")
+        except UnsupportedFeature as e:
+            check("only the score 'current'" in str(e), "current: current mixed with another score refused")
 
         print("3. Unsupported features are refused")
         try:
