@@ -36,18 +36,31 @@ def _fmt(v):
     return "0" if v == 0 else repr(round(v, 10))
 
 
+FAR = 1.0e9  # cm: "infinite" for the two workarounds below
+
+
 def prepare(model):
-    """Before MCNPy: give region-less cells an explicit everywhere region (MCNPy writes None as text and fails).
+    """Before MCNPy, change the model (without changing its geometry) where MCNPy 0.0.7 would fail:
+    - region-less cells get an explicit everywhere region (MCNPy writes None as text and then can't parse it);
+    - 2D RectLattices (infinite along z) become one z layer 2*FAR tall (MCNPy only handles 3D lattices).
     Returns notes."""
+    notes = []
     cells = [c for c in model.geometry.get_all_cells().values() if c.region is None]
-    if not cells:
-        return []
-    sid = max(model.geometry.get_all_surfaces(), default=0) + 1
-    big = openmc.Sphere(surface_id=sid, r=1.0e9)
-    for c in cells:
-        c.region = -big | +big
-    return [f"Cells {sorted(c.id for c in cells)} had no region (they fill everything); "
-            f"written as '-{sid}:{sid}' around a far sphere {sid}."]
+    if cells:
+        sid = max(model.geometry.get_all_surfaces(), default=0) + 1
+        big = openmc.Sphere(surface_id=sid, r=FAR)
+        for c in cells:
+            c.region = -big | +big
+        notes.append(f"Cells {sorted(c.id for c in cells)} had no region (they fill everything); "
+                     f"written as '-{sid}:{sid}' around a far sphere {sid}.")
+    for lat in model.geometry.get_all_lattices().values():
+        if isinstance(lat, openmc.RectLattice) and len(lat.pitch) == 2:
+            universes = [list(row) for row in lat.universes]
+            lat.pitch = (*lat.pitch, 2 * FAR)
+            lat.lower_left = (*lat.lower_left, -FAR)
+            lat.universes = [universes]
+            notes.append(f"Lattice {lat.id} is 2D (infinite along z); written as one z layer {2 * FAR:g} cm tall.")
+    return notes
 
 
 def _split_cards(block):
@@ -174,6 +187,8 @@ def rewrite(blocks, model):
                 raise UnsupportedFeature(f"Cell {c.id} fills lattice {L} with a translation or rotation; not supported yet.")
             blo, bhi = c.region.bounding_box
             for k in range(len(pitch)):
+                if dims[k] == 1 and pitch[k] >= 2 * FAR:
+                    continue  # the one z layer prepare() made from a 2D lattice covers everything
                 if not (math.isfinite(blo[k]) and math.isfinite(bhi[k])):
                     if lat.outer is None:
                         continue  # unbounded along k with no outer: OpenMC loses particles there too

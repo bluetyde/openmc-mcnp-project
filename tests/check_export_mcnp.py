@@ -7,6 +7,8 @@ Self-test for src/export_mcnp.py and src/validate_deck.py.
    with the expected message. A validator that passes everything proves nothing, so
    every check has to be seen failing.
 3. Asserts unsupported features are refused instead of exported.
+4. Exports rectangular lattices as LAT=1 / FILL cards and breaks them (surface order, FILL origin, FILL
+   array order, a TRCL) to show the geometry check notices each mistake.
 
 Run from the project root, in the openmc-mcnp env:
     python tests/check_export_mcnp.py
@@ -142,6 +144,76 @@ def rotated_model():
     return openmc.Model(openmc.Geometry(cells), openmc.Materials([lead, water]), settings)
 
 
+def _lattice_materials():
+    steel = openmc.Material(name="Steel")
+    steel.set_density("g/cm3", 7.9)
+    steel.add_element("Fe", 1.0)
+    water = openmc.Material(name="Water")
+    water.set_density("g/cm3", 1.0)
+    water.add_element("H", 2.0)
+    water.add_element("O", 1.0)
+    water.add_s_alpha_beta("c_H_in_H2O")
+    return steel, water
+
+
+def _world(R):
+    planes = [openmc.XPlane(-R, boundary_type="vacuum"), openmc.XPlane(R, boundary_type="vacuum"),
+              openmc.YPlane(-R, boundary_type="vacuum"), openmc.YPlane(R, boundary_type="vacuum"),
+              openmc.ZPlane(-R, boundary_type="vacuum"), openmc.ZPlane(R, boundary_type="vacuum")]
+    return +planes[0] & -planes[1] & +planes[2] & -planes[3] & +planes[4] & -planes[5]
+
+
+def _box(lo, hi):
+    return (+openmc.XPlane(lo[0]) & -openmc.XPlane(hi[0]) & +openmc.YPlane(lo[1]) & -openmc.YPlane(hi[1])
+            & +openmc.ZPlane(lo[2]) & -openmc.ZPlane(hi[2]))
+
+
+def lattice_3d_model():
+    """A 3 x 2 x 2 RectLattice of steel rods in water: pitch differs per axis, lower_left off the origin, and
+    element [2, 0, 1] (x index 2, y row 0 = bottom, z layer 1) holds a region-less water universe."""
+    openmc.reset_auto_ids()
+    steel, water = _lattice_materials()
+    rod = openmc.ZCylinder(r=1.2)
+    top, bottom = openmc.ZPlane(2.5), openmc.ZPlane(-2.5)
+    pin = openmc.Universe(cells=[openmc.Cell(name="Rod", fill=steel, region=-rod & +bottom & -top),
+                                 openmc.Cell(name="Rod water", fill=water, region=+rod | -bottom | +top)])
+    solid = openmc.Universe(cells=[openmc.Cell(name="Empty site", fill=water)])  # no region: fills everything
+    lat = openmc.RectLattice(name="Rods")
+    lat.pitch, lat.lower_left = (4.0, 5.0, 6.0), (-7.0, -3.0, 2.0)
+    grid = [[[pin] * 3 for _ in range(2)] for _ in range(2)]  # [z][y, top row first][x]
+    grid[1][1][2] = solid  # z layer 1, bottom row (y index 0), x index 2
+    lat.universes = grid
+    world = _world(20.0)
+    box = _box((-7.0, -3.0, 2.0), (5.0, 7.0, 14.0))
+    cells = [openmc.Cell(name="Lattice", fill=lat, region=box & world),
+             openmc.Cell(name="Outside", region=world & ~box)]
+    settings = openmc.Settings(run_mode="fixed source", particles=1000, batches=5, seed=1)
+    settings.source = openmc.IndependentSource(space=openmc.stats.Point((0, 0, 0)))
+    return openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
+
+
+def lattice_2d_outer_model():
+    """A 2D RectLattice (infinite in z) of 2 x 3 rods with an outer universe, inside a cell larger than the
+    lattice, so the MCNP index ranges must extend past the array and use the outer universe there."""
+    openmc.reset_auto_ids()
+    steel, water = _lattice_materials()
+    rod = openmc.ZCylinder(r=1.0)
+    pin = openmc.Universe(cells=[openmc.Cell(name="Rod", fill=steel, region=-rod),
+                                 openmc.Cell(name="Rod water", fill=water, region=+rod)])
+    outer = openmc.Universe(cells=[openmc.Cell(name="Outer water", fill=water)])
+    lat = openmc.RectLattice(name="Plane rods")
+    lat.pitch, lat.lower_left = (3.0, 3.0), (-3.0, -4.5)
+    lat.universes = [[pin, pin], [pin, outer], [pin, pin]]  # rows top first; middle row's right site is empty
+    lat.outer = outer
+    world = _world(15.0)
+    box = _box((-7.5, -8.0, -5.0), (6.0, 9.5, 5.0))
+    cells = [openmc.Cell(name="Lattice", fill=lat, region=box & world),
+             openmc.Cell(name="Outside", region=world & ~box)]
+    settings = openmc.Settings(run_mode="fixed source", particles=1000, batches=5, seed=1)
+    settings.source = openmc.IndependentSource(space=openmc.stats.Point((0, 0, 0)))
+    return openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
+
+
 def export_model(model, work, name):
     d = os.path.join(work, name)
     os.makedirs(d)
@@ -245,6 +317,59 @@ def main():
         text = pbase.replace("MODE N P", "MODE N")
         ok, out = validate_text(text, pmodel, work)
         check(text != pbase and not ok and "MODE has no P" in out, "[photon: P removed from MODE] rejected")
+
+
+        print("4. Rectangular lattices as MCNP LAT=1 / FILL")
+        lat_reports = {}
+        for name, build in [("lattice3d", lattice_3d_model), ("lattice2d", lattice_2d_outer_model)]:
+            r = export_model(build(), work, name)
+            lat_reports[name] = r
+            text = open(r["runnable"]).read()
+            check(r["ok"], f"{name}: exported deck validates")
+            check("geometry matches OpenMC" in r["validation"], f"{name}: geometry check followed the lattice and matched")
+            check(re.search(r"\bLAT=1\b", text) is not None and "TRCL" not in text.upper(),
+                  f"{name}: LAT=1 card written, no TRCL left from MCNPy")
+        text2d = open(lat_reports["lattice2d"]["runnable"]).read()
+        check(re.search(r"FILL=-2:2 -2:4 0:0 ", text2d) is not None,
+              "lattice2d: FILL ranges -2:2 -2:4 reach past the 2 x 3 array to cover its cell (outer universe there)")
+
+        base3 = open(lat_reports["lattice3d"]["runnable"]).read()
+        model3 = load_model(os.path.join(work, "lattice3d", "model.xml"))
+        lines3 = base3.split("\n")
+        li = next(i for i, l in enumerate(lines3) if re.search(r"\bLAT=1\b", l))
+        lj = li + 1
+        while lj < len(lines3) and lines3[lj].startswith("     "):
+            lj += 1
+        card = " ".join(l.strip() for l in lines3[li:lj])
+
+        def with_card(new_card):
+            return "\n".join(lines3[:li] + [new_card] + lines3[lj:])
+
+        def lat_mutate(desc, text, expect):
+            ok, out = validate_text(text, model3, work)
+            check(text != base3 and not ok and re.search(expect, out) is not None, f"[{desc}] rejected with /{expect}/")
+            if ok or re.search(expect, out) is None:
+                print("      validator said:\n" + "\n".join("      " + l for l in out.splitlines()[-8:]))
+
+        # 1. the first two surfaces swapped: index i now increases along -x, which mirrors the array
+        m = re.match(r"^(\d+ 0 )(-\d+) (\d+) ", card)
+        lat_mutate("lattice: first two element surfaces swapped", with_card(card.replace(m.group(0), f"{m.group(1)}{m.group(3)} {m.group(2)} ", 1)),
+                   r"Geometry:")
+        # 2. the filled cell's FILL origin moved by 1 cm in x
+        mo = re.search(r"FILL=(\d+) \((\S+) (\S+) (\S+)\)", base3)
+        moved = base3.replace(mo.group(0), f"FILL={mo.group(1)} ({float(mo.group(2)) + 1.0} {mo.group(3)} {mo.group(4)})", 1)
+        lat_mutate("lattice: FILL origin shifted 1 cm", moved, r"Geometry:")
+        # 3. the FILL array written j-fastest instead of i-fastest
+        fm = re.search(r"FILL=0:2 0:1 0:1 ((?:\d+ ){12})", card + " ")
+        vals = fm.group(1).split()
+        transposed = [vals[k * 6 + j * 3 + i] for k in range(2) for i in range(3) for j in range(2)]  # j fastest
+        lat_mutate("lattice: FILL array transposed", with_card(card.replace(fm.group(1), " ".join(transposed) + " ", 1)),
+                   r"Geometry:")
+        # 4. a TRCL put back on a unit-universe cell: the check must say it can't check, not pass
+        ui = next(i for i, l in enumerate(lines3) if re.match(r"^\d+ \d+ -?[0-9.]+ .*\bU \d+", l))
+        with_trcl = lines3[:]
+        with_trcl[ui] = re.sub(r"(\bU \d+)", r"\1 TRCL (0 0 1)", with_trcl[ui], count=1)
+        lat_mutate("lattice: TRCL on a unit cell", "\n".join(with_trcl), r"TRCL")
 
         print("3. Unsupported features are refused")
         try:

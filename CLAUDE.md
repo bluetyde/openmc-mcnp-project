@@ -112,6 +112,13 @@ the installed version instead.
   - `openmc_to_mcnp()` tags all cells with `U 1` without creating a Universe 0 container cell, causing MCNP to fail (`no cells in universe 0`).
   - `openmc_to_mcnp()` drops vacuum boundary conditions. MCNP has no vacuum surface type, and no outside cell with `IMP:N=0` is created, so every particle leaving the model would be lost. `remediate_deck.py` adds a graveyard cell (`#` complement of every root-universe cell).
   - `openmc_to_mcnp()` translates no tallies or sources (MCNPy has tally/source classes, but the OpenMC translator never uses them).
+  - `openmc_to_mcnp()` gets lattices wrong. It moves the unit universe's cells with TRCL, writes an element box that isn't centred on them, and picks index ranges that don't cover the lattice. For the NE403 graphite pile, every aperture ended up outside its element. `src/lattice_cards.py` rewrites the cards from the OpenMC `RectLattice`:
+    - element [0,0,0] is PX/PY/PZ planes around the origin, in the order +x, -x, +y, -y, +z, -z (MCNP 6.3 manual p. 290);
+    - `FILL=u`, or an array with i varying fastest (p. 291-292); OpenMC lists rows top first, so y is flipped;
+    - `FILL=L (x0 y0 z0)` on the filled cell;
+    - MCNPy's TRCL removed from the unit cells.
+    `HexLattice` is refused for now; OpenMC Studio writes hex arrays cell by cell.
+  - It writes a region-less cell (`openmc.Cell(fill=...)` with no region) as the text `None` and then fails ("Invalid character 'N'"), and it only handles 3D lattices. `lattice_cards.prepare()` runs before translation: it gives such cells a region covering everything, and makes a 2D lattice one z layer 2e9 cm tall. Neither changes the geometry.
   - All of these are remediated programmatically in `remediate_deck.py` (via `make_runnable_deck.py` for the pin cell, or `export_mcnp.py`) and asserted by `validate_deck.py`.
 - Remediation details that are easy to get wrong:
   - `F4` divides by cell volume by default; OpenMC cell tallies don't. Exported cell tallies get `SDn 1 ...` so the numbers are comparable. `FMESH` results are still per cm² (no SD equivalent), which the export reports as a note.
@@ -120,7 +127,16 @@ the installed version instead.
   - Before this generalization, `make_runnable_deck.py` wrote `KSRC 0.0 0.0 0.0` regardless of `settings.xml` despite its docstring; KSRC now comes from the source.
 - MontePy 1.1.3 importances: setting `cell.importance.photon` on a cell that was parsed with only `IMP:N` writes a duplicate neutron importance (`IMP:N=1.0 IMP:p,n=1.0`), and the written deck then fails to parse. `problem.cells.set_equal_importance()` raises `KeyError: 'photon'` in the same situation. Working pattern: `v = cell.importance.neutron; del cell.importance.neutron; cell.importance.neutron = v; cell.importance.photon = v` (written as `IMP:n,p=`).
 - MontePy 1.1.3 parses `SDEF` as a `ForbiddenDataInput`: it round-trips the text but can't be edited through the object model. `SI`/`SP`/`F`/`E`/`FM`/`SD`/`FMESH`/`NPS`/`KCODE`/`KSRC` parse as generic `DataInput`.
-- The geometry check is sampling-based evidence, not a proof: small features can be missed, and it supports only P (4-constant), PX/PY/PZ, SO/S/SX/SY/SZ, CX/CY/CZ, C/X/C/Y/C/Z and GQ surfaces in universe 0 without transformations. Decks outside that are reported as "could not run", never silently passed.
+- The geometry check is sampling-based evidence, not a proof: small features can be missed.
+  - Surfaces: P (4-constant), PX/PY/PZ, SO/S/SX/SY/SZ, CX/CY/CZ, C/X/C/Y/C/Z and GQ.
+  - Universes: it follows FILL (with a translation) and LAT=1 lattices bounded by PX/PY/PZ planes.
+  - TRCL, rotated fills, surface transformations and LAT=2 are reported as "could not run", never silently passed.
+  - Its lattice rules come from the MCNP 6.3 manual. The writer (`lattice_cards.py`) follows the same reading of it, so the final proof is an MCNP plot or run of a lattice deck (not done yet: no MCNP here).
+- MCNPy's Java bridge (metapy/py4j) always uses port 25333, and there is only one per machine.
+  - A second process that imports `mcnpy` attaches to the running bridge instead of starting its own.
+  - When the process that started the bridge exits, `atexit` kills it, and the others fail with `ConnectionRefusedError ... 25333`.
+  - Run one MCNPy job at a time; OpenMC Studio's own MCNP worker counts as one.
+  - Don't use `metapy/java_cleanup.sh`: it kills the most recently started Java process on the machine.
 - No MCNP executable is installed in this environment, so exported decks are validated by MontePy, `validate_deck.py` and the geometry check, but have not been run through MCNP itself.
 - MontePy: `problem.mode` is not included in `write_to_file()` output by
   itself — `_write_to_stream()` only walks `cells`/`surfaces`/`data_inputs`,

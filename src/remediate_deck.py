@@ -12,7 +12,8 @@ MCNPy 0.0.7 gaps fixed here (see CLAUDE.md "Known quirks"):
 4. Run control and source: eigenvalue -> KSRC (from the OpenMC source) + KCODE;
    fixed source -> SDEF (+ SI/SP) + NPS.
 5. MODE N, or MODE N P with IMP:P on every cell when photons are transported.
-6. Tallies: F4/E4/FM/SD for cell tallies, FMESH for regular-mesh tallies.
+6. Tallies: F4/E4/FM/SD for cell tallies, FMESH for regular and cylindrical mesh tallies.
+7. Lattices: MCNPy's LAT/FILL cards are rewritten from the OpenMC RectLattices (src/lattice_cards.py).
 
 Generated cards come from src/mcnp_cards.py (derived from the OpenMC objects), the
 result is parsed and written by MontePy, and src/validate_deck.py checks it.
