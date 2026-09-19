@@ -29,6 +29,7 @@ from montepy.universe import Universe
 import lattice_cards
 import mcnp_cards
 from mcnp_cards import UnsupportedFeature
+from deck_format import format_deck
 
 
 def load_model(path):
@@ -137,7 +138,7 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
     fd, tmp = tempfile.mkstemp(suffix=".mcnp")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(augmented)
+            f.write(format_deck(augmented))
         problem = montepy.read_input(tmp)
 
         # 1. universe 0
@@ -169,7 +170,7 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
             deck_text = deck_text.rstrip("\n") + "\n" + "\n".join(t_cards) + "\n"
         deck_text = decorate_deck(deck_text, model, graveyard_id=graveyard)
         with open(out_deck, "w") as f:
-            f.write(deck_text)
+            f.write(format_deck(deck_text))
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -348,4 +349,3 @@ def decorate_deck(text, model, graveyard_id=None):
         new_b2.append(line)
 
     return "\n\n".join(["\n".join(new_b0), "\n".join(new_b1), "\n".join(new_b2)]) + "\n"
-

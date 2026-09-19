@@ -22,7 +22,7 @@ hand between those stages.
 
 All deck modifications must be programmatically generated and validated via automated assertion checks (`src/validate_deck.py`). Never hand-author raw MCNP cell/surface cards from memory as a substitute for running translation and programmatic validation tools. Wrapping unparsed string buffers in generic classes (e.g. `DataInput`) satisfies the letter of tool mediation while providing none of its protection unless accompanied by automated deck validation checks.
 
-MCNP's fixed-format, 80-column, FORTRAN-era syntax fails quietly: a wrong column or a misplaced sign produces a deck that parses and runs but models something different from what was intended. So when a tool can't express something, programmatically remediate it and assert its validity via automated scripts.
+MCNP 6.3 input is limited to 128 columns after tab expansion (manual section 3.2.2). Column-sensitive syntax can fail quietly: a wrong column or a misplaced sign produces a deck that parses and runs but models something different from what was intended. So when a tool can't express something, programmatically remediate it and assert its validity via automated scripts.
 
 This applies to edits too. Changing a density inside an existing deck goes through MontePy — it parses the deck, mutates the object, re-serializes while preserving formatting and comments, and validates the output.
 

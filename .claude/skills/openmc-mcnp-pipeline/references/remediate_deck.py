@@ -12,24 +12,35 @@ MCNPy 0.0.7 gaps fixed here (see CLAUDE.md "Known quirks"):
 4. Run control and source: eigenvalue -> KSRC (from the OpenMC source) + KCODE;
    fixed source -> SDEF (+ SI/SP) + NPS.
 5. MODE N, or MODE N P with IMP:P on every cell when photons are transported.
-6. Tallies: F4/E4/FM/SD for cell tallies, FMESH for regular-mesh tallies.
+6. Tallies: F4/E4/FM/SD for cell tallies, FMESH for regular and cylindrical mesh tallies.
+7. Lattices: MCNPy's LAT/FILL cards are rewritten from the OpenMC RectLattices (src/lattice_cards.py).
 
 Generated cards come from src/mcnp_cards.py (derived from the OpenMC objects), the
 result is parsed and written by MontePy, and src/validate_deck.py checks it.
 """
 import os
+import re
 import tempfile
 
 import montepy
 import openmc
 from montepy.universe import Universe
 
+import lattice_cards
 import mcnp_cards
 from mcnp_cards import UnsupportedFeature
+from deck_format import format_deck
 
 
 def load_model(path):
-    """Load an OpenMC model from model.xml, or from a folder holding model.xml or the separate XML files."""
+    """Load an OpenMC model from model.xml, or from a folder holding model.xml or the separate XML files.
+    Hex lattices with one axial level are repaired after reading (lattice_cards.fix_loaded_hex_lattices)."""
+    model = _load_model(path)
+    lattice_cards.fix_loaded_hex_lattices(model)
+    return model
+
+
+def _load_model(path):
     if os.path.isdir(path):
         if os.path.exists(os.path.join(path, "model.xml")):
             return openmc.Model.from_model_xml(os.path.join(path, "model.xml"))
@@ -68,7 +79,7 @@ def _graveyard_card(number, cell_ids):
     return "\n".join(lines)
 
 
-def remediate(source_deck, model, out_deck, sab_map=None):
+def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=None):
     """Write a runnable deck to out_deck. Returns a report dict of what was added."""
     sab = dict(mcnp_cards.SAB_MCNP_MAP)
     sab.update(sab_map or {})
@@ -82,6 +93,10 @@ def remediate(source_deck, model, out_deck, sab_map=None):
     if len(blocks) < 3:
         raise ValueError(f"{source_deck} doesn't have cell, surface and data blocks separated by blank lines.")
 
+    # 1b. lattices: MCNPy's LAT/FILL cards are rewritten from the OpenMC lattices (src/lattice_cards.py)
+    lattice_maps = {}  # lattice id -> MCNP LAT cell and index map, for tally chains
+    report["notes"] += lattice_cards.rewrite(blocks, model, lattice_maps)
+
     # 2. graveyard cell for vacuum boundaries (inserted at the end of the cell block)
     vac = vacuum_surfaces(geometry)
     graveyard = None
@@ -94,12 +109,15 @@ def remediate(source_deck, model, out_deck, sab_map=None):
     # 3. MT cards
     cards = []
     for mat in materials:
+        sab_ids = []
         for name, _fraction in getattr(mat, "_sab", []):
             if name not in sab:
                 raise UnsupportedFeature(
                     f"Material {mat.id} ({mat.name}) uses S(a,b) table '{name}', which has no MCNP identifier "
                     f"in SAB_MCNP_MAP. Add one (check your xsdir) or pass --sab {name}=<id>.")
-            cards.append(f"MT{mat.id} {sab[name]}")
+            sab_ids.append(sab[name])
+        if sab_ids:
+            cards.append(f"MT{mat.id} {' '.join(sab_ids)}")
 
     # 4-6. source, mode, run control, tallies (order matches the original pin-cell remediation)
     if eigen:
@@ -108,17 +126,19 @@ def remediate(source_deck, model, out_deck, sab_map=None):
     else:
         cards.append(mcnp_cards.mode_card(settings))
         cards += mcnp_cards.fixed_source_cards(settings)
-    t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry)
-    cards += t_cards
+    t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry, model.materials, detector_responses,
+                                              lattice_maps)
     report["notes"] += t_notes
-    report["added"] += [c.split("\n")[0] for c in cards]
+    report["added"] += [c.split("\n")[0] for c in cards + t_cards]
 
+    # tallies go on after MontePy has written the deck: MontePy 1.1.3 can't parse tally chains
+    # (1 < 7[0 0 0] < 3), and it has nothing to change in the tally cards
     augmented = "\n\n".join(blocks).strip() + "\n" + "\n".join(cards) + "\n"
 
     fd, tmp = tempfile.mkstemp(suffix=".mcnp")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(augmented)
+            f.write(format_deck(augmented))
         problem = montepy.read_input(tmp)
 
         # 1. universe 0
@@ -144,6 +164,13 @@ def remediate(source_deck, model, out_deck, sab_map=None):
             report["added"].append("IMP:P on every cell (same as IMP:N)")
 
         problem.write_to_file(out_deck, overwrite=True)
+        with open(out_deck) as f:
+            deck_text = f.read()
+        if t_cards:
+            deck_text = deck_text.rstrip("\n") + "\n" + "\n".join(t_cards) + "\n"
+        deck_text = decorate_deck(deck_text, model, graveyard_id=graveyard)
+        with open(out_deck, "w") as f:
+            f.write(format_deck(deck_text))
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -151,3 +178,174 @@ def remediate(source_deck, model, out_deck, sab_map=None):
     report["graveyard_cell"] = graveyard
     report["run_mode"] = settings.run_mode
     return report
+
+
+def decorate_deck(text, model, graveyard_id=None):
+    """Add pedagogical comment cards and clear section dividers to an MCNP deck.
+
+    Provides students and researchers with clear explanations of card syntax, cell names,
+    material compositions, densities, and tally definitions without altering transport physics.
+    """
+    blocks = text.split("\n\n")
+    if len(blocks) < 3:
+        return text
+
+    model_cells = model.geometry.get_all_cells() if model and getattr(model, "geometry", None) else {}
+    model_surfs = model.geometry.get_all_surfaces() if model and getattr(model, "geometry", None) else {}
+    model_mats = {m.id: m for m in (model.materials if model and getattr(model, "materials", None) else [])}
+
+    # 1. Block 0: Title & Cells
+    cell_lines = blocks[0].splitlines()
+    title = cell_lines[0] if cell_lines else "OpenMC Studio MCNP 6.3 Input Deck"
+    new_b0 = [title]
+    new_b0.extend([
+        "c ===================================================================",
+        "c BLOCK 1: CELL CARDS",
+        "c Format: <cell_id> <mat_id> <density> <surfaces> <parameters>",
+        "c   - Material 0 = void (vacuum)",
+        "c   - Negative density = mass density in g/cm3; positive = at/b-cm",
+        "c   - Positive surface = outside (+); negative surface = inside (-)",
+        "c ===================================================================",
+    ])
+
+    for line in cell_lines[1:]:
+        sline = line.strip()
+        if not sline or sline.startswith("c") or sline.startswith("$"):
+            new_b0.append(line)
+            continue
+        parts = sline.split()
+        if parts and parts[0].isdigit():
+            cid = int(parts[0])
+            if cid == graveyard_id or cid == 999:
+                new_b0.append("c --- Cell 999: Outside World (vacuum boundary, particles terminated) ---")
+            else:
+                c = model_cells.get(cid)
+                if c:
+                    name = getattr(c, "name", "") or f"Cell {cid}"
+                    fill = getattr(c, "fill", None)
+                    if fill is None:
+                        fill_desc = "void"
+                    elif hasattr(fill, "name"):
+                        rho = getattr(fill, "density", None)
+                        rho_str = f", rho = -{rho:.4g} g/cm3" if rho else ""
+                        fill_desc = f"Material {fill.id}: {fill.name}{rho_str}"
+                    elif hasattr(fill, "id"):
+                        fill_desc = f"Universe {fill.id}"
+                    else:
+                        fill_desc = str(fill)
+                    new_b0.append(f"c --- Cell {cid}: {name} ({fill_desc}) ---")
+        new_b0.append(line)
+
+    # 2. Block 1: Surfaces
+    surf_lines = blocks[1].splitlines()
+    new_b1 = [
+        "c ===================================================================",
+        "c BLOCK 2: SURFACE CARDS",
+        "c Format: <surf_id> <mnemonic> <parameters in cm>",
+        "c ===================================================================",
+    ]
+    for line in surf_lines:
+        sline = line.strip()
+        if not sline or sline.startswith("c") or sline.startswith("$"):
+            new_b1.append(line)
+            continue
+        parts = sline.split()
+        if parts and parts[0].isdigit():
+            sid = int(parts[0])
+            s = model_surfs.get(sid)
+            if s:
+                stype = type(s).__name__
+                sname = getattr(s, "name", "")
+                sname_str = f" {sname}" if sname else ""
+                new_b1.append(f"c --- Surface {sid}:{sname_str} ({stype}) ---")
+        new_b1.append(line)
+
+    # 3. Block 2: Data Cards
+    data_lines = ("\n\n".join(blocks[2:])).splitlines()
+    new_b2 = [
+        "c ===================================================================",
+        "c BLOCK 3: DATA CARDS (Materials, Physics, Source, Tallies)",
+        "c ===================================================================",
+    ]
+
+    in_materials = False
+    in_source = False
+    in_tallies = False
+    for line in data_lines:
+        sline = line.strip()
+        if not sline or sline.startswith("c") or sline.startswith("$"):
+            new_b2.append(line)
+            continue
+        parts = sline.split()
+        head = parts[0].upper()
+
+        m_mat = re.match(r"^M(\d+)$", head)
+        if m_mat:
+            mid = int(m_mat.group(1))
+            mat = model_mats.get(mid)
+            mat_name = getattr(mat, "name", "") if mat else ""
+            rho = getattr(mat, "density", None) if mat else None
+            rho_str = f", rho = {rho:.4g} g/cm3" if rho else ""
+            if not in_materials:
+                new_b2.extend([
+                    "c -------------------------------------------------------------------",
+                    "c Materials & Thermal Scattering S(alpha, beta)",
+                    "c Format: M<id> <zaid> <fraction> (negative = wt%, positive = at%)",
+                    "c -------------------------------------------------------------------",
+                ])
+                in_materials = True
+            new_b2.append(f"c --- Material {mid}: {mat_name}{rho_str} ---")
+            new_b2.append(line)
+            continue
+
+        m_mt = re.match(r"^MT(\d+)$", head)
+        if m_mt:
+            mid = int(m_mt.group(1))
+            new_b2.append(f"c MT{mid}: Thermal neutron scattering S(alpha, beta) for Material {mid}")
+            new_b2.append(line)
+            continue
+
+        if head == "MODE":
+            new_b2.extend([
+                "c -------------------------------------------------------------------",
+                "c Particle Transport Mode",
+                "c -------------------------------------------------------------------",
+            ])
+            new_b2.append(line)
+            continue
+
+        if head in ("SDEF", "KCODE", "KSRC") and not in_source:
+            new_b2.extend([
+                "c -------------------------------------------------------------------",
+                "c Source Definition & Run Control",
+                "c -------------------------------------------------------------------",
+            ])
+            in_source = True
+            if head == "KCODE":
+                new_b2.append("c KCODE: particles/batch, initial keff guess, inactive batches, total batches")
+            elif head == "KSRC":
+                new_b2.append("c KSRC: Initial fission source spatial guess point(s)")
+            elif head == "SDEF":
+                new_b2.append("c SDEF: General particle source distribution")
+            new_b2.append(line)
+            continue
+
+        if head == "NPS":
+            new_b2.append("c NPS: Total particle histories to simulate")
+            new_b2.append(line)
+            continue
+
+        if (head.startswith("FMESH") or (head.startswith("F") and len(head) > 1 and head[1].isdigit())) and not in_tallies:
+            new_b2.extend([
+                "c -------------------------------------------------------------------",
+                "c Tallies",
+                "c Format: F<n>:<p> <cells/surfaces> (e.g., F4: volume flux, F1: surface current)",
+                "c -------------------------------------------------------------------",
+            ])
+            in_tallies = True
+            new_b2.append(line)
+            continue
+
+        new_b2.append(line)
+
+    return "\n\n".join(["\n".join(new_b0), "\n".join(new_b1), "\n".join(new_b2)]) + "\n"

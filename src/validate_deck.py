@@ -29,6 +29,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 import montepy
+from deck_format import overlong_lines
 
 
 def _load_model(model_path):
@@ -66,6 +67,8 @@ def _cards_by_name(raw_text):
     """{card name: words} for every data card, continuation lines (leading spaces) joined."""
     cards, cur = {}, None
     for l in raw_text.splitlines():
+        if re.match(r"^ {0,4}[cC](?:\s|$)", l) or l.lstrip().startswith("$"):
+            continue
         if l.startswith(" ") and l.strip():
             if cur is not None:
                 cards[cur] += l.split()
@@ -264,6 +267,13 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
 
     if not os.path.exists(deck_path):
         print(f"FAIL: Deck file '{deck_path}' does not exist.")
+        return False
+
+    with open(deck_path) as stream:
+        too_long = overlong_lines(stream.read())
+    if too_long:
+        detail = ", ".join(f"{line} ({width} columns)" for line, width in too_long[:10])
+        print(f"FAIL: MCNP input exceeds 128 columns after tab expansion: lines {detail}.")
         return False
 
     try:
