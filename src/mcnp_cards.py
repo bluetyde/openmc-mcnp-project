@@ -21,12 +21,49 @@ import openmc.stats
 # "h-h2o.40t"), so check them against your xsdir before running, and override with
 # --sab NAME=ID in export_mcnp.py when they differ.
 SAB_MCNP_MAP = {
-    "c_H_in_H2O": "lwtr.01t",
-    "c_D_in_D2O": "hwtr.01t",
-    "c_Graphite": "grph.01t",
-    "c_Be": "be.01t",
-    "c_Zr_in_ZrH": "zrh.01t",
-    "c_H_in_CH2": "poly.01t",
+    # Hydrogen / Water
+    "c_H_in_H2O": "h-h2o.40t",
+    "c_H_in_H2O_solid": "h-ice.40t",
+    "c_ortho_H": "orthoH.40t",
+    "c_para_H": "paraH.40t",
+    # Heavy Water / Deuterium
+    "c_D_in_D2O": "d-d2o.40t",
+    "c_O_in_D2O": "o-d2o.40t",
+    "c_ortho_D": "orthoD.40t",
+    "c_para_D": "paraD.40t",
+    # Carbon / Graphite
+    "c_Graphite": "grph.40t",
+    "c_Graphite_10p": "grph10.40t",
+    "c_Graphite_30p": "grph30.40t",
+    "c_C6H6": "benz.40t",
+    # Polymers / Hydrocarbons
+    "c_H_in_CH2": "h-poly.40t",
+    "c_H_in_C5O2H8": "h-luci.40t",
+    "c_H_in_CH4_liquid": "lmeth.40t",
+    "c_H_in_CH4_solid": "smeth.40t",
+    # Beryllium
+    "c_Be": "be-met.40t",
+    "c_Be_in_BeO": "be-beo.40t",
+    "c_O_in_BeO": "o-beo.40t",
+    # Hydrides
+    "c_H_in_ZrH": "h-zrh.40t",
+    "c_Zr_in_ZrH": "zr-zrh.40t",
+    "c_H_in_YH2": "h-yh2.40t",
+    "c_Y_in_YH2": "y-yh2.40t",
+    # Fuels
+    "c_U_in_UO2": "u-uo2.40t",
+    "c_O_in_UO2": "o-uo2.40t",
+    "c_U_in_UN": "u-un.40t",
+    "c_N_in_UN": "n-un.40t",
+    # Silicon / Oxides / Carbides
+    "c_SiO2_alpha": "sio2.40t",
+    "c_SiO2_beta": "sio2.40t",
+    "c_Si_in_SiC": "si-sic.40t",
+    "c_C_in_SiC": "c-sic.40t",
+    # Metals
+    "c_Al27": "al-27.40t",
+    "c_Fe56": "fe-56.40t",
+    "c_O_in_H2O_solid": "o-ice.40t",
 }
 
 # OpenMC reaction score -> MCNP FM reaction list (inside the parentheses of an FM bin).
