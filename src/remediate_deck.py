@@ -68,7 +68,7 @@ def _graveyard_card(number, cell_ids):
     return "\n".join(lines)
 
 
-def remediate(source_deck, model, out_deck, sab_map=None):
+def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=None):
     """Write a runnable deck to out_deck. Returns a report dict of what was added."""
     sab = dict(mcnp_cards.SAB_MCNP_MAP)
     sab.update(sab_map or {})
@@ -108,7 +108,7 @@ def remediate(source_deck, model, out_deck, sab_map=None):
     else:
         cards.append(mcnp_cards.mode_card(settings))
         cards += mcnp_cards.fixed_source_cards(settings)
-    t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry, model.materials)
+    t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry, model.materials, detector_responses)
     cards += t_cards
     report["notes"] += t_notes
     report["added"] += [c.split("\n")[0] for c in cards]

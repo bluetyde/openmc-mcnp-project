@@ -230,48 +230,60 @@ def _can_fission(material):
 
 
 
-def _resolve_energy_fn(eff, tally_name, materials):
-    """Resolve an EnergyFunctionFilter into (mat_id, mt, scale) for MCNP FM card."""
-    is_micro = bool(len(eff.y) and eff.y[0] > 10.0)
-    scale = "1" if is_micro else "-1"
+def _detector_fm(t, materials, detector_responses):
+    """FM multiplier (C, m, R) for a tally with an EnergyFunctionFilter (a detector response).
 
-    tname = (tally_name or "").lower()
-    target_nuc = None
-    mt = "103"
-    if "he-3" in tname or "he3" in tname:
-        target_nuc = "he3"
-        mt = "103"
-    elif "b-10" in tname or "b10" in tname:
-        target_nuc = "b10"
-        mt = "107"
-    elif "fission" in tname:
-        mt = "-6"
-    elif "absorption" in tname:
-        mt = "-2"
-    elif "capture" in tname or "gamma" in tname:
-        mt = "102"
+    The filter holds only numbers, so the response comes from OpenMC Studio's `detector_responses`
+    ({tally id: {"material", "nuclide", "mt", "scale"}}) in model.py. MCNP's FM (C m R) multiplies the flux
+    by C times material m's cross section for reaction R, summed over m's nuclides by atom fraction:
+      macro (N_i * sigma_i, 1/cm): C = total atom density of m (atoms/b-cm)
+      micro (sigma of one nuclide, barns): C = 1 / that nuclide's atom fraction in m
+    Returns (card_args, note)."""
+    info = (detector_responses or {}).get(t.id)
+    if not info:
+        raise UnsupportedFeature(
+            f"Tally '{t.name}': its EnergyFunctionFilter has no detector description, so the matching MCNP FM "
+            f"card is unknown. Export it from OpenMC Studio (model.py's detector_responses) or remove the filter.")
+    mats = {m.id: m for m in (materials or [])}
+    mat = mats.get(info.get("material"))
+    if mat is None:
+        raise UnsupportedFeature(f"Tally '{t.name}': its detector material isn't in the model's materials.")
+    dens = mat.get_nuclide_atom_densities()
+    total = sum(dens.values())
+    nuc, mt, scale = info.get("nuclide") or "all", int(info["mt"]), info.get("scale", "macro")
+    others = [n for n in dens if n != nuc] if nuc != "all" else []
+    if scale == "micro":
+        if nuc not in dens:
+            raise UnsupportedFeature(f"Tally '{t.name}': {nuc} isn't in detector material {mat.id}, so MCNP can't "
+                                     f"give its microscopic cross section.")
+        c = total / dens[nuc]
+    else:
+        c = total
+        if nuc != "all" and nuc not in dens:
+            raise UnsupportedFeature(f"Tally '{t.name}': {nuc} isn't in detector material {mat.id}.")
+    note = (f"Tally '{t.name}': detector response ({scale}, MT {mt}) as FM with material {mat.id}; C = "
+            + (f"1/atom fraction of {nuc}" if scale == "micro" else "its atom density") + ".")
+    if others:
+        note += (f" MCNP sums reaction {mt} over every nuclide in material {mat.id} ({', '.join(sorted(dens))}); "
+                 f"OpenMC used only {nuc}. They agree if the others don't have that reaction.")
+    return f"{num(c)} {mat.id} {mt}", note
 
-    mat_id = None
-    if materials:
-        if target_nuc:
-            for m in materials:
-                if any(target_nuc in n.name.lower() for n in m.nuclides):
-                    mat_id = m.id
-                    break
-        if mat_id is None:
-            for m in materials:
-                if any("he3" in n.name.lower() for n in m.nuclides):
-                    mat_id = m.id
-                    mt = "103"
-                    break
-                elif any("b10" in n.name.lower() for n in m.nuclides):
-                    mat_id = m.id
-                    mt = "107"
-                    break
 
-    return mat_id, mt, scale
+def _cyl_fmesh(n, t, m):
+    """FMESH GEOM=CYL for an openmc.CylindricalMesh about z: I = radius, J = height, K = angle (revolutions)."""
+    r, phi, z = (list(map(float, g)) for g in (m.r_grid, m.phi_grid, m.z_grid))
+    if abs(r[0]) > 1e-12 or abs(phi[0]) > 1e-12:
+        raise UnsupportedFeature(f"Tally '{t.name}': MCNP cylindrical meshes start at r = 0 and angle 0.")
+    ox, oy, oz = (float(v) for v in m.origin)
+    lst = lambda vals: " ".join(num(v) for v in vals)
+    ones = lambda vals: " ".join("1" for _ in vals)
+    return (f"FMESH{n}:N GEOM=CYL ORIGIN={num(ox)} {num(oy)} {num(oz + z[0])} AXS=0 0 1 VEC=1 0 0"
+            f"\n     IMESH={lst(r[1:])} IINTS={ones(r[1:])}"
+            f"\n     JMESH={lst(v - z[0] for v in z[1:])} JINTS={ones(z[1:])}"
+            f"\n     KMESH={lst(v / (2 * 3.141592653589793) for v in phi[1:])} KINTS={ones(phi[1:])}")
 
-def tally_cards(tallies, geometry, materials=None):
+
+def tally_cards(tallies, geometry, materials=None, detector_responses=None):
     """F4/E4/FM/SD for cell tallies and FMESH for regular-mesh tallies.
 
     Returns (cards, notes). Cell tallies get SD=1 so MCNP reports volume-integrated
@@ -296,6 +308,10 @@ def tally_cards(tallies, geometry, materials=None):
                 pass
             elif isinstance(f, openmc.EnergyFunctionFilter):
                 energy_fn_f = f
+            elif isinstance(f, (openmc.SurfaceFilter, openmc.CellFromFilter)):
+                raise UnsupportedFeature(f"Tally '{t.name}': surface current tallies aren't exported to MCNP yet "
+                                         f"(MCNP F1 counts crossings anywhere on a surface, not only on one cell's face). "
+                                         f"Remove the tally to export the rest.")
             else:
                 raise UnsupportedFeature(f"Tally '{t.name}': {type(f).__name__} isn't supported.")
         if bool(cell_f) == bool(mesh_f):
@@ -336,10 +352,9 @@ def tally_cards(tallies, geometry, materials=None):
                             f"'(n,gamma)' separately instead.")
                     cards.append(f"FM{n} (-1 {mat_id} {SCORE_FM[score]})")
                 elif energy_fn_f is not None:
-                    resp_mat_id, mt, scale = _resolve_energy_fn(energy_fn_f, t.name, materials)
-                    if resp_mat_id and mt:
-                        cards.append(f"FM{n} ({scale} {resp_mat_id} {mt})")
-                        notes.append(f"Tally '{t.name}' (F{n}): EnergyFunctionFilter translated to MCNP multiplier FM{n} ({scale} {resp_mat_id} {mt}).")
+                    fm, note = _detector_fm(t, materials, detector_responses)
+                    cards.append(f"FM{n} ({fm})")
+                    notes.append(note)
                 if e_card:
                     cards.append(f"E{n} {e_card}")
                 cards.append(f"SD{n} " + " ".join("1" for _ in ids))
@@ -348,17 +363,19 @@ def tally_cards(tallies, geometry, materials=None):
                     raise UnsupportedFeature(f"Tally '{t.name}': mesh tallies support only 'flux' "
                                              f"(a mesh spans several materials).")
                 m = mesh_f.mesh
-                if not isinstance(m, openmc.RegularMesh) or len(m.dimension) != 3:
-                    raise UnsupportedFeature(f"Tally '{t.name}': only 3D RegularMesh is supported.")
-                (nx, ny, nz), lo, hi = m.dimension, m.lower_left, m.upper_right
-                card = (f"FMESH{n}:N GEOM=XYZ ORIGIN={num(lo[0])} {num(lo[1])} {num(lo[2])}"
-                        f"\n     IMESH={num(hi[0])} IINTS={int(nx)} JMESH={num(hi[1])} JINTS={int(ny)}"
-                        f"\n     KMESH={num(hi[2])} KINTS={int(nz)}")
+                if isinstance(m, openmc.CylindricalMesh):
+                    card = _cyl_fmesh(n, t, m)
+                elif isinstance(m, openmc.RegularMesh) and len(m.dimension) == 3:
+                    (nx, ny, nz), lo, hi = m.dimension, m.lower_left, m.upper_right
+                    card = (f"FMESH{n}:N GEOM=XYZ ORIGIN={num(lo[0])} {num(lo[1])} {num(lo[2])}"
+                            f"\n     IMESH={num(hi[0])} IINTS={int(nx)} JMESH={num(hi[1])} JINTS={int(ny)}"
+                            f"\n     KMESH={num(hi[2])} KINTS={int(nz)}")
+                else:
+                    raise UnsupportedFeature(f"Tally '{t.name}': only 3D RegularMesh and CylindricalMesh are supported.")
                 if energy_fn_f is not None:
-                    resp_mat_id, mt, scale = _resolve_energy_fn(energy_fn_f, t.name, materials)
-                    if resp_mat_id and mt:
-                        card += f"\n     FM={scale} {resp_mat_id} {mt}"
-                        notes.append(f"Tally '{t.name}' (FMESH{n}): EnergyFunctionFilter translated to FMESH multiplier FM={scale} {resp_mat_id} {mt}.")
+                    fm, note = _detector_fm(t, materials, detector_responses)
+                    card += f"\n     FM={fm}"
+                    notes.append(note)
                 if e_card:
                     card += f"\n     EMESH={e_card}"
                 cards.append(card)
