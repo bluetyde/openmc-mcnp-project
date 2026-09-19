@@ -33,6 +33,17 @@ from mcnp_cards import UnsupportedFeature
 from deck_format import format_deck
 
 
+ASCII_SUBS = {"\u00d7": "x", "\u00b0": " deg", "\u00b5": "u", "\u03bc": "u", "\u2013": "-", "\u2014": "-",
+               "\u2212": "-", "\u00b2": "2", "\u00b3": "3"}
+
+
+def _ascii(text):
+    """MCNP input is ASCII (p. 24): common symbols become their plain spelling, anything else '?'. Studio part
+    names carry things like 12x11 written with a multiplication sign, which must not reach the deck."""
+    text = "".join(ASCII_SUBS.get(ch, ch) for ch in str(text))
+    return text.encode("ascii", "replace").decode("ascii")
+
+
 def load_model(path):
     """Load an OpenMC model from model.xml, or from a folder holding model.xml or the separate XML files.
     Hex lattices with one axial level are repaired after reading (lattice_cards.fix_loaded_hex_lattices)."""
@@ -226,16 +237,18 @@ def decorate_deck(text, model, graveyard_id=None):
             else:
                 c = model_cells.get(cid)
                 if c:
-                    name = getattr(c, "name", "") or f"Cell {cid}"
+                    name = _ascii(getattr(c, "name", "") or f"Cell {cid}")
                     fill = getattr(c, "fill", None)
                     if fill is None:
                         fill_desc = "void"
-                    elif hasattr(fill, "name"):
+                    elif isinstance(fill, openmc.Material):  # a lattice or universe has a name too, so test the type
                         rho = getattr(fill, "density", None)
                         rho_str = f", rho = -{rho:.4g} g/cm3" if rho else ""
-                        fill_desc = f"Material {fill.id}: {fill.name}{rho_str}"
+                        fill_desc = f"Material {fill.id}: {_ascii(fill.name)}{rho_str}"
+                    elif isinstance(fill, openmc.Lattice):
+                        fill_desc = f"filled by lattice {fill.id}: {_ascii(fill.name)}" if fill.name else f"filled by lattice {fill.id}"
                     elif hasattr(fill, "id"):
-                        fill_desc = f"Universe {fill.id}"
+                        fill_desc = f"filled by universe {fill.id}"
                     else:
                         fill_desc = str(fill)
                     new_b0.append(f"c --- Cell {cid}: {name} ({fill_desc}) ---")
@@ -260,7 +273,7 @@ def decorate_deck(text, model, graveyard_id=None):
             s = model_surfs.get(sid)
             if s:
                 stype = type(s).__name__
-                sname = getattr(s, "name", "")
+                sname = _ascii(getattr(s, "name", ""))
                 sname_str = f" {sname}" if sname else ""
                 if len(parts) > 1 and parts[1].upper() in ("RPP", "RCC", "SPH", "BOX"):
                     stype = f"{parts[1].upper()} Macrobody"
@@ -290,7 +303,7 @@ def decorate_deck(text, model, graveyard_id=None):
         if m_mat:
             mid = int(m_mat.group(1))
             mat = model_mats.get(mid)
-            mat_name = getattr(mat, "name", "") if mat else ""
+            mat_name = _ascii(getattr(mat, "name", "")) if mat else ""
             rho = getattr(mat, "density", None) if mat else None
             rho_str = f", rho = {rho:.4g} g/cm3" if rho else ""
             if not in_materials:
