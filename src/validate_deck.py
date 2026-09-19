@@ -138,18 +138,18 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
         if cell.universe is None or cell.universe.number == 0:
             cells_in_u0 += 1
         else:
-            non_zero.add(cell.universe.number)
+            non_zero.add(abs(cell.universe.number))
         fill = getattr(cell, "fill", None)
-        if fill:
-            if hasattr(fill, "number"):
-                filled.add(fill.number)
+        if fill is not None:  # a single universe, or a lattice FILL array (any level)
+            if getattr(fill, "multiple_universes", False) and getattr(fill, "universes", None) is not None:
+                filled.update(abs(u.number) for u in fill.universes.ravel() if u is not None)
             elif getattr(fill, "universe", None) is not None and hasattr(fill.universe, "number"):
-                filled.add(fill.universe.number)
+                filled.add(abs(fill.universe.number))
     if cells_in_u0 == 0:
         errors.append("Universe 0 hierarchy error: All cells are tagged with non-zero Universe IDs, "
                       "and no cell resides in Universe 0. MCNP will fail with 'no cells in universe 0'.")
     elif non_zero and not non_zero.issubset(filled):
-        errors.append(f"Orphaned non-zero Universes detected {non_zero - filled} without corresponding FILL cards in Universe 0.")
+        errors.append(f"Orphaned non-zero Universes detected {non_zero - filled}: no FILL (or lattice FILL array) uses them.")
 
     if model is not None:
         # 5. vacuum boundary -> graveyard

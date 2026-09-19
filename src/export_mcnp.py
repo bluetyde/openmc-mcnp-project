@@ -22,21 +22,26 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import lattice_cards  # noqa: E402
 from mcnp_cards import UnsupportedFeature  # noqa: E402
 from remediate_deck import load_model, remediate  # noqa: E402
 from validate_deck import validate_deck  # noqa: E402
 
 
-def translate(model, out_path):
+def translate(model, out_path, stdout=None):
+    """MCNPy translation of the geometry and materials to out_path. MCNPy's printing goes to `stdout`
+    (discarded by default; OpenMC Studio passes a stream that turns its stage lines into progress).
+    Returns notes about changes made so MCNPy can translate the model."""
     try:
         from mcnpy.translate_mcnp_openmc import openmc_to_mcnp
     except ImportError as e:
         raise RuntimeError("MCNPy is not importable in this environment. See CLAUDE.md 'MCNPy install notes'. "
                            f"Original error: {e}")
-    # MCNPy prints progress and JVM gateway messages; keep them out of this script's output.
-    with contextlib.redirect_stdout(io.StringIO()):
+    notes = lattice_cards.prepare(model)
+    with contextlib.redirect_stdout(stdout if stdout is not None else io.StringIO()):
         deck = openmc_to_mcnp(model.geometry, model.materials, model.settings)
         deck.write(out_path)
+    return notes
 
 
 def export(model_path, out_dir=None, name=None, sab=None, samples=20000):
@@ -51,10 +56,11 @@ def export(model_path, out_dir=None, name=None, sab=None, samples=20000):
     report.update(translated=translated, runnable=runnable)
 
     report["stage"] = "translate"
-    translate(model, translated)
+    prep_notes = translate(model, translated)
 
     report["stage"] = "remediate"
     report.update(remediate(translated, model, runnable, sab_map=sab))
+    report["notes"] = prep_notes + report.get("notes", [])
 
     report["stage"] = "validate"
     buf = io.StringIO()

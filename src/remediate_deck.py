@@ -24,6 +24,7 @@ import montepy
 import openmc
 from montepy.universe import Universe
 
+import lattice_cards
 import mcnp_cards
 from mcnp_cards import UnsupportedFeature
 
@@ -81,6 +82,9 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
     blocks = base_text.split("\n\n")
     if len(blocks) < 3:
         raise ValueError(f"{source_deck} doesn't have cell, surface and data blocks separated by blank lines.")
+
+    # 1b. lattices: MCNPy's LAT/FILL cards are rewritten from the OpenMC lattices (src/lattice_cards.py)
+    report["notes"] += lattice_cards.rewrite(blocks, model)
 
     # 2. graveyard cell for vacuum boundaries (inserted at the end of the cell block)
     vac = vacuum_surfaces(geometry)
