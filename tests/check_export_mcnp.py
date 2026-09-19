@@ -15,6 +15,9 @@ Self-test for src/export_mcnp.py and src/validate_deck.py.
 7. Exports surface currents (SurfaceFilter x CellFromFilter, as OpenMC Studio writes them) as F1 + C + FS
    tallies, including a face cut by another part and a net current, refuses what MCNP can't match, and
    breaks the cards (FS sign, FS surface, direction, F1 surface, C card).
+8. Exports several independent sources as one SDEF (ERG picks the source, the rest depends on it) for point +
+   sphere, point + box and point + cylinder mixes, refuses two different volume shapes, and breaks the cards
+   (positions swapped, strengths, energy order, radius order, particle).
 
 Run from the project root, in the openmc-mcnp env:
     python tests/check_export_mcnp.py
@@ -292,6 +295,43 @@ def current_model():
     settings.source = openmc.IndependentSource(space=openmc.stats.Point((0.0, 0.0, 0.0)))
     model = openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
     model.tallies = openmc.Tallies([out, net])
+    return model
+
+
+def multi_source_model(kind):
+    """A water box with a flux tally and two or three sources of different strength, energy, particle and
+    direction. kind: 'sphere' (monodirectional point neutron + isotropic photon sphere shell + point), 'box'
+    (box + point) or 'cylinder' (cylinder + point), or 'mixed' (box + sphere, which MCNP can't share)."""
+    openmc.reset_auto_ids()
+    steel, water = _lattice_materials()
+    world = _world(20.0)
+    cell = openmc.Cell(name="Water", fill=water, region=world)
+    st = openmc.stats
+    point = st.Point((1.0, 2.0, 3.0))
+    point2 = st.Point((-4.0, 0.0, 1.0))
+    sphere = st.spherical_uniform(r_outer=3.0, r_inner=1.0, origin=(5.0, 0.0, 0.0))
+    box = st.Box((-6.0, -5.0, -4.0), (-2.0, 5.0, 4.0))
+    cyl = st.CylindricalIndependent(r=st.PowerLaw(0.0, 2.0, 1), phi=st.Uniform(0.0, 2 * 3.141592653589793),
+                                    z=st.Uniform(-1.5, 2.5), origin=(0.0, 6.0, -2.0))
+    S = openmc.IndependentSource
+    if kind == "sphere":
+        sources = [S(space=point, energy=st.Discrete([2e6], [1.0]), angle=st.Monodirectional((0.0, 0.0, 1.0)), strength=1.0),
+                   S(space=sphere, energy=st.Discrete([0.5e6, 1.2e6], [0.3, 0.7]), particle="photon", strength=3.0),
+                   S(space=point2, energy=st.Watt(), strength=0.5)]
+    elif kind == "box":
+        sources = [S(space=box, energy=st.Uniform(1e6, 2e6), strength=2.0), S(space=point, energy=st.Maxwell(1.3e6), strength=1.0)]
+    elif kind == "cylinder":
+        sources = [S(space=point2, energy=st.Tabular([1e5, 1e6, 3e6], [0.2, 0.8], interpolation="histogram"), strength=1.0),
+                   S(space=cyl, energy=st.Discrete([14.1e6], [1.0]), strength=4.0)]
+    else:
+        sources = [S(space=box, strength=1.0), S(space=sphere, strength=1.0)]
+    settings = openmc.Settings(run_mode="fixed source", particles=1000, batches=5, seed=1)
+    settings.source = sources
+    model = openmc.Model(openmc.Geometry([cell]), openmc.Materials([water]), settings)
+    t = openmc.Tally(name="flux")
+    t.filters = [openmc.CellFilter([cell])]
+    t.scores = ["flux"]
+    model.tallies = openmc.Tallies([t])
     return model
 
 
@@ -621,19 +661,62 @@ def main():
         except UnsupportedFeature as e:
             check("only the score 'current'" in str(e), "current: current mixed with another score refused")
 
+        print("8. Several sources in one SDEF")
+        src_texts = {}
+        for kind in ("sphere", "box", "cylinder"):
+            r = export_model(multi_source_model(kind), work, f"src_{kind}")
+            text = open(r["runnable"]).read()
+            src_texts[kind] = (text, load_model(os.path.join(work, f"src_{kind}", "model.xml")))
+            check(r["ok"], f"sources ({kind}): deck validates")
+            check("sources read back from the SDEF match OpenMC's" in r["validation"], f"sources ({kind}): every source read back and matched")
+            check(re.search(r"^SI(\d+) S ", text, re.M) is not None and re.search(r"ERG=D\d+", text) is not None,
+                  f"sources ({kind}): ERG picks the source (SI S)")
+        stext = src_texts["sphere"][0]
+        check("PAR=FERG=D" in stext and "MODE N P" in stext, "sources (sphere): particle depends on the source; MODE N P for the photon source")
+        check("VEC=FERG=D" in stext and "DIR=FERG=D" in stext, "sources (sphere): direction depends on the source (one monodirectional)")
+        check(re.search(r"X=FERG=D", src_texts["box"][0]) is not None, "sources (box): X/Y/Z depend on the source")
+        check("AXS=0.0 0.0 1.0" in src_texts["cylinder"][0] and "EXT=FERG=D" in src_texts["cylinder"][0],
+              "sources (cylinder): AXS fixed, RAD/EXT depend on the source")
+        try:
+            export_model(multi_source_model("mixed"), work, "src_mixed")
+            check(False, "sources: a box and a sphere source refused")
+        except UnsupportedFeature as e:
+            check("box and sphere" in str(e), "sources: a box and a sphere source refused (one SDEF shape)")
+
+        smodel = src_texts["sphere"][1]
+
+        def src_mutate(desc, change, expect):
+            text = change(stext)
+            ok, out = validate_text(text, smodel, work)
+            check(text != stext and not ok and re.search(expect, out) is not None, f"[sources: {desc}] rejected with /{expect}/")
+            if ok or re.search(expect, out) is None:
+                print("      validator said:\n" + "\n".join("      " + l for l in out.splitlines()[-6:]))
+
+        def ds_of(key):
+            return re.search(rf"{key}=FERG=D(\d+)", stext).group(1)
+
+        def swap_groups(card, size, a=0, b=1):
+            def f(m):
+                w = m.group(2).split()
+                g = [w[i:i + size] for i in range(0, len(w), size)]
+                g[a], g[b] = g[b], g[a]
+                return m.group(1) + " ".join(x for grp in g for x in grp)
+            return lambda t: re.sub(rf"^({card} [LS] )(.*)$", f, t, count=1, flags=re.M)
+        sel = re.search(r"(?<![A-Z])ERG=D(\d+)", stext).group(1)  # not the ERG in PAR=FERG=Dn
+        src_mutate("first two positions swapped", swap_groups(f"DS{ds_of('POS')}", 3), r"Source \d: .*POS gives")
+        src_mutate("strengths changed", lambda t: re.sub(rf"^SP{sel} .*$", f"SP{sel} 1 1 1", t, count=1, flags=re.M), rf"SP{sel} .* doesn't match")
+        src_mutate("energies in the wrong order", lambda t: re.sub(rf"^(SI{sel} S )(\d+) (\d+)", r"\g<1>\3 \2", t, count=1, flags=re.M),
+                   r"Source \d: energy")
+        src_mutate("radius distributions swapped", swap_groups(f"DS{ds_of('RAD')}", 1), r"Source \d: (radius|a point source needs RAD)")
+        src_mutate("particle list changed", lambda t: re.sub(rf"^DS{ds_of('PAR')} L .*$", f"DS{ds_of('PAR')} L 1 1 1", t, count=1, flags=re.M),
+                   r"Source 2: MCNP particle")
+
         print("3. Unsupported features are refused")
         try:
             export_model(shielding_model(absorption_in_fuel=True), work, "absorb")
             check(False, "absorption in fuel refused")
         except UnsupportedFeature as e:
             check("absorption" in str(e) and "actinides" in str(e), "absorption in fuel refused with reason")
-        m = shielding_model()
-        m.settings.source = [m.settings.source[0], openmc.IndependentSource()]
-        try:
-            export_model(m, work, "twosrc")
-            check(False, "two sources refused")
-        except UnsupportedFeature as e:
-            check("single source" in str(e), "two sources refused with reason")
         m = shielding_model()
         m.materials[0]._sab = [("c_made_up_table", 1.0)]
         try:

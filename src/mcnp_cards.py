@@ -196,13 +196,125 @@ def _require_full_angle(space, what):
         raise UnsupportedFeature(f"{what} source: only a full 0-2π azimuthal range is supported.")
 
 
+def _check_source(s, i=None):
+    """Refusals shared by the single- and multi-source SDEF writers. Returns the MCNP particle number."""
+    what = "Source" if i is None else f"Source {i + 1}"
+    if not isinstance(s, openmc.IndependentSource):
+        raise UnsupportedFeature(f"{type(s).__name__} sources aren't supported (only IndependentSource).")
+    if getattr(s, "time", None) is not None:
+        raise UnsupportedFeature(f"{what}: source time distributions aren't supported.")
+    if getattr(s, "constraints", None):
+        raise UnsupportedFeature(f"{what}: source domain constraints aren't supported.")
+    particle = getattr(s, "particle", "neutron")
+    if particle not in ("neutron", "photon"):
+        raise UnsupportedFeature(f"{what}: source particle '{particle}' isn't supported.")
+    angle = s.angle
+    if angle is not None and not isinstance(angle, (openmc.stats.Isotropic, openmc.stats.Monodirectional)):
+        raise UnsupportedFeature(f"{what}: source angle {type(angle).__name__} isn't supported.")
+    return 1 if particle == "neutron" else 2
+
+
+def _source_shape(s, i):
+    """(kind, params) of a source's space: point (xyz), box (lo, hi), sphere (origin, r_in, r_out) or
+    cylinder (origin, r_in, r_out, z_lo, z_hi), with the same limits as the single-source writer."""
+    space = s.space
+    if space is None:
+        return "point", (0.0, 0.0, 0.0)
+    if isinstance(space, openmc.stats.Point):
+        return "point", tuple(float(c) for c in space.xyz)
+    if isinstance(space, openmc.stats.Box):
+        return "box", (tuple(map(float, space.lower_left)), tuple(map(float, space.upper_right)))
+    if isinstance(space, openmc.stats.SphericalIndependent):
+        r, ct = space.r, space.cos_theta
+        if not (isinstance(r, openmc.stats.PowerLaw) and _close(r.n, 2)):
+            raise UnsupportedFeature(f"Source {i + 1} (sphere): radius must be uniform in volume (PowerLaw n=2).")
+        if not (isinstance(ct, openmc.stats.Uniform) and _close(ct.a, -1) and _close(ct.b, 1)):
+            raise UnsupportedFeature(f"Source {i + 1} (sphere): only a full polar range (cos θ from -1 to 1) is supported.")
+        _require_full_angle(space, f"Source {i + 1} (sphere)")
+        return "sphere", (tuple(map(float, space.origin)), float(r.a), float(r.b))
+    if isinstance(space, openmc.stats.CylindricalIndependent):
+        r, z = space.r, space.z
+        if not (isinstance(r, openmc.stats.PowerLaw) and _close(r.n, 1)):
+            raise UnsupportedFeature(f"Source {i + 1} (cylinder): radius must be uniform in area (PowerLaw n=1).")
+        if not isinstance(z, openmc.stats.Uniform):
+            raise UnsupportedFeature(f"Source {i + 1} (cylinder): height must be a Uniform distribution.")
+        _require_full_angle(space, f"Source {i + 1} (cylinder)")
+        return "cylinder", (tuple(map(float, space.origin)), float(r.a), float(r.b), float(z.a), float(z.b))
+    raise UnsupportedFeature(f"Source {i + 1}: source space {type(space).__name__} isn't supported.")
+
+
+def _multi_source_sdef(sources):
+    """One SDEF for several independent sources (manual p. 379-408).
+
+    ERG is the independent variable: SI1 S lists one energy distribution per source and SP1 their strengths, so
+    sampling ERG picks the source (SI option S, p. 397). Every other variable depends on ERG (KEY=FERG=Dn, p. 379)
+    through a DS card with one entry per source: DS L for values (POS, VEC, PAR), DS S for distributions (RAD,
+    EXT, X, Y, Z, DIR) (p. 402-403; the pattern of Examples 12-13, p. 408). ERG is the selector rather than POS
+    because position keywords may not depend on POS (p. 379).
+
+    MCNP picks one volume shape per SDEF from the keywords present (X/Y/Z: box, AXS: cylinder, else sphere around
+    POS; p. 387), so point sources mix with any one of box, sphere or cylinder sources, but two different volume
+    shapes can't share the card. Returns (sdef words, distribution cards)."""
+    pars = [_check_source(s, i) for i, s in enumerate(sources)]
+    shapes = [_source_shape(s, i) for i, s in enumerate(sources)]
+    volume = sorted({k for k, _ in shapes} - {"point"})
+    if len(volume) > 1:
+        raise UnsupportedFeature(
+            f"Sources mix {' and '.join(volume)} shapes. MCNP's single SDEF card has one volume shape (chosen by its "
+            f"keywords: X/Y/Z box, AXS cylinder, POS/RAD sphere, manual p. 387), so point sources can go with any one "
+            f"of them but two different volume shapes can't. Use one shape, or points.")
+    family = volume[0] if volume else "point"
+    dists = _Dists()
+    fixed = lambda value: dists.add(f"L {value}", "1")[1:]  # a single value as a discrete distribution number
+    energies = []
+    for s in sources:
+        e = _energy(s.energy, dists)
+        energies.append(e[1:] if e.startswith("D") else fixed(e))
+    sel = dists.next
+    dists.next += 1
+    dists.cards.append(f"SI{sel} S " + " ".join(energies))
+    dists.cards.append(f"SP{sel} " + " ".join(num(float(s.strength)) for s in sources))
+
+    def dep(option, values):
+        n = dists.next
+        dists.next += 1
+        dists.cards.append(f"DS{n} {option} " + " ".join(values))
+        return f"FERG=D{n}"
+
+    words = [f"PAR={pars[0]}" if len(set(pars)) == 1 else "PAR=" + dep("L", [str(p) for p in pars]), f"ERG=D{sel}"]
+    xyz = lambda v: " ".join(num(c) for c in v)
+    if family == "box":
+        for k, axis in enumerate("XYZ"):
+            subs = [fixed(num(p[k])) if kind == "point" else dists.add(f"H {num(p[0][k])} {num(p[1][k])}", "0 1")[1:]
+                    for kind, p in shapes]
+            words.append(f"{axis}=" + dep("S", subs))
+    else:
+        words.append("POS=" + dep("L", [xyz(p if kind == "point" else p[0]) for kind, p in shapes]))
+        if family == "cylinder":
+            words.append("AXS=0.0 0.0 1.0")
+        if family in ("sphere", "cylinder"):
+            power = "2" if family == "sphere" else "1"
+            words.append("RAD=" + dep("S", [fixed("0") if kind == "point" else dists.add(f"{num(p[1])} {num(p[2])}", f"-21 {power}")[1:]
+                                            for kind, p in shapes]))
+        if family == "cylinder":
+            words.append("EXT=" + dep("S", [fixed("0") if kind == "point" else dists.add(f"{num(p[3])} {num(p[4])}", "-21 0")[1:]
+                                            for kind, p in shapes]))
+    mono = [isinstance(s.angle, openmc.stats.Monodirectional) for s in sources]
+    if any(mono):
+        words.append("VEC=" + dep("L", [xyz(s.angle.reference_uvw) if m else "0.0 0.0 1.0" for s, m in zip(sources, mono)]))
+        words.append("DIR=" + dep("S", [fixed("1") if m else dists.add("H -1 1", "0 1")[1:] for m in mono]))
+    return words, dists.cards
+
+
 def fixed_source_cards(settings):
-    """SDEF (+ SI/SP) and NPS for a single independent source."""
+    """SDEF (+ SI/SP/DS) and NPS. Several sources go through _multi_source_sdef."""
     sources = _sources(settings)
     if not sources:
         sources = [openmc.IndependentSource()]  # OpenMC default: point at origin, isotropic, Watt
+    nps = f"NPS {int(settings.particles) * int(settings.batches)}"
     if len(sources) > 1:
-        raise UnsupportedFeature(f"{len(sources)} sources: only a single source is supported for SDEF export.")
+        words, cards = _multi_source_sdef(sources)
+        return ["SDEF " + words[0] + "".join(f"\n     {w}" for w in words[1:])] + cards + [nps]
     s = sources[0]
     if not isinstance(s, openmc.IndependentSource):
         raise UnsupportedFeature(f"{type(s).__name__} sources aren't supported (only IndependentSource).")

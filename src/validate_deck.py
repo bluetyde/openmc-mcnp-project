@@ -62,6 +62,167 @@ def _read_deck(deck_path):
         os.remove(tmp)
 
 
+def _cards_by_name(raw_text):
+    """{card name: words} for every data card, continuation lines (leading spaces) joined."""
+    cards, cur = {}, None
+    for l in raw_text.splitlines():
+        if l.startswith(" ") and l.strip():
+            if cur is not None:
+                cards[cur] += l.split()
+            continue
+        w = l.split()
+        cur = w[0] if w else None
+        if cur is not None:
+            cards[cur] = w[1:]
+    return cards
+
+
+def _close_all(a, b, rel=1e-6):
+    return len(a) == len(b) and all(abs(x - y) <= rel * max(1.0, abs(x), abs(y)) for x, y in zip(a, b))
+
+
+def _check_sources(raw_text, sources):
+    """Read a multi-source SDEF back (ERG=Dn with SI S; other keywords =FERG=Dm with DS L/S, manual p. 379-408)
+    and compare each source with the OpenMC source in the same position: strength, particle, shape and
+    position, energy distribution and direction. The reading here is written independently of the writer in
+    mcnp_cards, so entries listed in the wrong order are caught. Returns a list of errors."""
+    import openmc
+    cards = _cards_by_name(raw_text)
+    sdef = " ".join(cards.get("SDEF", []))
+    kw = {m.group(1): m.group(2).strip() for m in re.finditer(r"(\w+)=((?:(?!\s\w+=).)*)", sdef)}
+    k = len(sources)
+    m = re.fullmatch(r"D(\d+)", kw.get("ERG", ""))
+    if not m:
+        return [f"{k} sources, but SDEF ERG isn't a distribution (ERG=Dn) that picks the source."]
+    sel = m.group(1)
+    si, sp = cards.get(f"SI{sel}", []), cards.get(f"SP{sel}", [])
+    if not si or si[0] != "S" or len(si) - 1 != k:
+        return [f"SDEF ERG=D{sel}: SI{sel} must be 'S' with one energy distribution per source ({k}), found {si}."]
+    errors = []
+    strengths = [float(s.strength) for s in sources]
+    got = [float(v) for v in sp]
+    if len(got) != k or not _close_all([g / sum(got) for g in got], [s / sum(strengths) for s in strengths]):
+        errors.append(f"SP{sel} {sp} doesn't match the OpenMC source strengths {strengths}.")
+
+    def dist(n):
+        n = str(n).lstrip("D")
+        si, sp = cards.get(f"SI{n}", []), cards.get(f"SP{n}", [])
+        opt = si[0] if si and si[0] in ("H", "L", "A", "S") else ("H" if si else None)
+        spopt = sp[0] if sp and sp[0] in ("D", "C") else None
+        return (opt, [float(v) for v in (si[1:] if si and si[0] in ("H", "L", "A", "S") else si)],
+                [float(v) for v in (sp[1:] if spopt else sp)])
+
+    def per_source(key):
+        """For each source: ('value', [numbers]) or ('dist', (SI option, SI values, SP values)); None if absent."""
+        v = kw.get(key)
+        if v is None:
+            return None
+        dm = re.fullmatch(r"FERG=D(\d+)", v)
+        if not dm:
+            return [("value", [float(x) for x in v.split()])] * k
+        ds = cards.get(f"DS{dm.group(1)}", [])
+        if not ds or ds[0] not in ("L", "S"):
+            errors.append(f"SDEF {key}={v}: DS{dm.group(1)} must be L or S.")
+            return [None] * k
+        vals = ds[1:]
+        if len(vals) % k:
+            errors.append(f"DS{dm.group(1)} has {len(vals)} entries, not a multiple of the {k} sources.")
+            return [None] * k
+        g = len(vals) // k
+        if ds[0] == "L":
+            return [("value", [float(x) for x in vals[i * g:(i + 1) * g]]) for i in range(k)]
+        if g != 1:
+            errors.append(f"DS{dm.group(1)} S needs one distribution per source.")
+            return [None] * k
+        return [("dist", dist(vals[i])) for i in range(k)]
+
+    def scalar(entry, what):
+        """A dependent entry that must be one value: ('value', [v]) or a one-point discrete distribution."""
+        if entry is None:
+            return None
+        kind, d = entry
+        if kind == "value":
+            return d[0] if len(d) == 1 else None
+        opt, vals, probs = d
+        return vals[0] if opt == "L" and len(vals) == 1 else None
+
+    par, pos, rad, ext = per_source("PAR"), per_source("POS"), per_source("RAD"), per_source("EXT")
+    axes = [per_source(a) for a in "XYZ"]
+    vec, dirs = per_source("VEC"), per_source("DIR")
+    shape = "box" if kw.get("X") else ("cylinder" if kw.get("AXS") else "sphere")
+    for i, (s, e) in enumerate(zip(sources, si[1:])):
+        tag = f"Source {i + 1}"
+        want_par = 1 if getattr(s, "particle", "neutron") == "neutron" else 2
+        if par is not None and scalar(par[i], "PAR") != want_par:
+            errors.append(f"{tag}: MCNP particle {par[i]}, OpenMC {s.particle}.")
+        space = s.space
+        if isinstance(space, openmc.stats.Point) or space is None:
+            p = tuple(space.xyz) if space is not None else (0.0, 0.0, 0.0)
+            if shape == "box":
+                got = [scalar(a[i], "XYZ") if a else None for a in axes]
+                if None in got or not _close_all(got, p):
+                    errors.append(f"{tag}: point {p} in OpenMC, but X/Y/Z give {[a[i] if a else None for a in axes]}.")
+            else:
+                if not (pos and pos[i] and pos[i][0] == "value" and _close_all(pos[i][1], p)):
+                    errors.append(f"{tag}: point {p} in OpenMC, but POS gives {pos[i] if pos else None}.")
+                for key, entry in (("RAD", rad), ("EXT", ext)):
+                    if entry is not None and scalar(entry[i], key) not in (0.0,):
+                        errors.append(f"{tag}: a point source needs {key} 0, found {entry[i]}.")
+        elif isinstance(space, openmc.stats.Box):
+            for a, lo, hi, name in zip(axes, space.lower_left, space.upper_right, "XYZ"):
+                d = a[i][1] if a and a[i] and a[i][0] == "dist" else None
+                if not (d and d[0] == "H" and _close_all(d[1], [lo, hi]) and _close_all(d[2], [0, 1])):
+                    errors.append(f"{tag}: box {name} range {lo}..{hi} in OpenMC, but {name} gives {a[i] if a else None}.")
+        else:
+            cyl = isinstance(space, openmc.stats.CylindricalIndependent)
+            if shape != ("cylinder" if cyl else "sphere"):
+                errors.append(f"{tag}: a {'cylinder' if cyl else 'sphere'} source, but the SDEF keywords make a {shape}.")
+                continue
+            if not (pos and pos[i] and pos[i][0] == "value" and _close_all(pos[i][1], list(space.origin))):
+                errors.append(f"{tag}: origin {tuple(space.origin)} in OpenMC, but POS gives {pos[i] if pos else None}.")
+            d = rad[i][1] if rad and rad[i] and rad[i][0] == "dist" else None
+            if not (d and _close_all(d[1], [space.r.a, space.r.b]) and _close_all(d[2], [-21, 1 if cyl else 2])):
+                errors.append(f"{tag}: radius {space.r.a}..{space.r.b} in OpenMC, but RAD gives {rad[i] if rad else None}.")
+            if cyl:
+                d = ext[i][1] if ext and ext[i] and ext[i][0] == "dist" else None
+                if not (d and _close_all(d[1], [space.z.a, space.z.b]) and _close_all(d[2], [-21, 0])):
+                    errors.append(f"{tag}: height {space.z.a}..{space.z.b} in OpenMC, but EXT gives {ext[i] if ext else None}.")
+        # energy: the i-th distribution on the ERG selector (eV in OpenMC, MeV in MCNP)
+        opt, vals, probs = dist(e)
+        en = s.energy if s.energy is not None else openmc.stats.Watt(a=0.988e6, b=2.249e-6)
+        ok = False
+        if isinstance(en, openmc.stats.Discrete):
+            p = [float(v) / sum(en.p) for v in en.p]
+            ok = opt == "L" and _close_all(vals, [x / 1e6 for x in en.x]) and (
+                len(p) == 1 and probs == [1.0] or sum(probs) > 0 and _close_all([v / sum(probs) for v in probs], p))
+        elif isinstance(en, openmc.stats.Watt):
+            ok = not vals and _close_all(probs, [-3, en.a / 1e6, en.b * 1e6])
+        elif isinstance(en, openmc.stats.Maxwell):
+            ok = not vals and _close_all(probs, [-2, en.theta / 1e6])
+        elif isinstance(en, openmc.stats.Uniform):
+            ok = opt == "H" and _close_all(vals, [en.a / 1e6, en.b / 1e6]) and _close_all(probs, [0, 1])
+        elif isinstance(en, openmc.stats.Tabular):
+            ok = opt == "H" and _close_all(vals, [x / 1e6 for x in en.x])
+        if not ok:
+            errors.append(f"{tag}: energy {type(en).__name__} in OpenMC doesn't match distribution {e} "
+                          f"(SI {opt} {vals}, SP {probs}).")
+        # direction
+        mono = isinstance(s.angle, openmc.stats.Monodirectional)
+        if dirs is None:
+            if mono:
+                errors.append(f"{tag}: monodirectional in OpenMC, but the SDEF has no DIR.")
+        else:
+            d = dirs[i][1] if dirs[i] and dirs[i][0] == "dist" else None
+            is_mono = bool(d) and d[0] == "L" and d[1] == [1.0]
+            is_iso = bool(d) and d[0] == "H" and _close_all(d[1], [-1, 1]) and _close_all(d[2], [0, 1])
+            if mono and not (is_mono and vec and vec[i] and _close_all(vec[i][1], list(s.angle.reference_uvw))):
+                errors.append(f"{tag}: monodirectional along {tuple(s.angle.reference_uvw)} in OpenMC, but DIR/VEC give "
+                              f"{dirs[i]} / {vec[i] if vec else None}.")
+            if not mono and not is_iso:
+                errors.append(f"{tag}: isotropic in OpenMC, but DIR gives {dirs[i]}.")
+    return errors
+
+
 def _tally_card_texts(raw_text):
     """[(name, bins text)] for every F and FMESH card, continuation lines (leading spaces) joined."""
     cards, cur = [], None
@@ -151,6 +312,14 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
     has_kcode, has_ksrc, has_sdef, has_nps = starts("KCODE"), starts("KSRC"), starts("SDEF"), starts("NPS")
     run_mode = model.settings.run_mode if model is not None else None
     if run_mode == "fixed source":
+        srcs = model.settings.source
+        srcs = list(srcs) if isinstance(srcs, (list, tuple)) else ([srcs] if srcs is not None else [])
+        if len(srcs) > 1 and has_sdef:
+            src_errors = _check_sources(raw_text, srcs)
+            errors += src_errors
+            if not src_errors:
+                passed.append(f"{len(srcs)} sources read back from the SDEF match OpenMC's (strength, particle, "
+                              f"position and shape, energy, direction)")
         if has_kcode:
             errors.append("The OpenMC model is fixed source but the deck has a KCODE card.")
         if not has_sdef:

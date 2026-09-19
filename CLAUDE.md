@@ -133,6 +133,12 @@ the installed version instead.
   - MontePy 1.1.3 can't parse tally chains (the `<`). `remediate()` therefore appends the tally cards after MontePy has written the deck (they're the last cards anyway), and `validate_deck` gives MontePy a copy with each chain replaced by its bottom cell.
   - Before this generalization, `make_runnable_deck.py` wrote `KSRC 0.0 0.0 0.0` regardless of `settings.xml` despite its docstring; KSRC now comes from the source.
 - MontePy 1.1.3 importances: setting `cell.importance.photon` on a cell that was parsed with only `IMP:N` writes a duplicate neutron importance (`IMP:N=1.0 IMP:p,n=1.0`), and the written deck then fails to parse. `problem.cells.set_equal_importance()` raises `KeyError: 'photon'` in the same situation. Working pattern: `v = cell.importance.neutron; del cell.importance.neutron; cell.importance.neutron = v; cell.importance.photon = v` (written as `IMP:n,p=`).
+- Several sources (`mcnp_cards._multi_source_sdef`) go on one SDEF card.
+  - `ERG=Dn` with `SI n S` lists one energy distribution per source, so sampling ERG picks the source (SI option S, manual p. 397). `SP n` holds the strengths.
+  - Everything else is `KEY=FERG=Dm`, a DS card with one entry per source: `DS L` for values (POS, VEC, PAR) and `DS S` for distributions (X/Y/Z, RAD, EXT, DIR) (p. 402-403; the pattern of Examples 12-13, p. 408).
+  - ERG is the selector, not POS, because p. 379 forbids position keywords (RAD, X, ...) that depend on POS. The manual's own Example 10 breaks that rule, so it's avoided.
+  - MCNP picks one volume shape per SDEF from its keywords (X/Y/Z box, AXS cylinder, otherwise a sphere around POS; p. 387). Point sources therefore mix with any one of box, sphere or cylinder, and two different volume shapes are refused.
+  - `validate_deck._check_sources` reads the SDEF/SI/SP/DS cards back from the deck text and compares strength, particle, position/shape, energy and direction with each OpenMC source, so a list in the wrong order is caught.
 - MontePy 1.1.3 parses `SDEF` as a `ForbiddenDataInput`: it round-trips the text but can't be edited through the object model. `SI`/`SP`/`F`/`E`/`FM`/`SD`/`FMESH`/`NPS`/`KCODE`/`KSRC` parse as generic `DataInput`.
 - The geometry check is sampling-based evidence, not a proof: small features can be missed.
   - Surfaces: P (4-constant), PX/PY/PZ, SO/S/SX/SY/SZ, CX/CY/CZ, C/X/C/Y/C/Z and GQ.
