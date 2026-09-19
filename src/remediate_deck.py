@@ -106,12 +106,15 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
     # 3. MT cards
     cards = []
     for mat in materials:
+        sab_ids = []
         for name, _fraction in getattr(mat, "_sab", []):
             if name not in sab:
                 raise UnsupportedFeature(
                     f"Material {mat.id} ({mat.name}) uses S(a,b) table '{name}', which has no MCNP identifier "
                     f"in SAB_MCNP_MAP. Add one (check your xsdir) or pass --sab {name}=<id>.")
-            cards.append(f"MT{mat.id} {sab[name]}")
+            sab_ids.append(sab[name])
+        if sab_ids:
+            cards.append(f"MT{mat.id} {' '.join(sab_ids)}")
 
     # 4-6. source, mode, run control, tallies (order matches the original pin-cell remediation)
     if eigen:
