@@ -188,23 +188,29 @@ is mass density in g/cm³; positive is atom density in atoms/barn-cm.
 
 ## Reference scripts
 
-Working versions of each stage, in `references/`. Read the one matching the current stage — they
-show the actual API shapes, which matter more than the physics here since the physics is
-model-specific and the API details are the part that's easy to get wrong.
+**Read the live code in `src/`.** It is the working version of every stage, and it shows the actual API
+shapes, which matter more than the physics here: the physics is model-specific, the API details are what's
+easy to get wrong.
 
 | File | Stage |
 |---|---|
-| `references/openmc_model.py` | 1 — build model, export XML |
-| `references/translate_to_mcnp.py` | 2 — OpenMC → MCNP via MCNPy |
-| `references/make_runnable_deck.py` | 3 — add `MODE`/`KCODE` via MontePy |
-| `references/montepy_sweep.py` | 4 — parameter sweep over a deck |
-| `references/validate_deck.py` | validation for any stage-3 deck |
-| `references/export_mcnp.py` | any model: translate + remediate + validate |
-| `references/remediate_deck.py` | remediation used by both `make_runnable_deck.py` and `export_mcnp.py` |
-| `references/mcnp_cards.py` | SDEF/KCODE/tally cards from OpenMC objects; S(a,b) and FM reaction maps |
-| `references/geometry_check.py` | sampled-point geometry comparison against OpenMC |
+| `src/openmc_model.py` | 1 — build model, export XML |
+| `src/translate_to_mcnp.py` | 2 — OpenMC → MCNP via MCNPy |
+| `src/make_runnable_deck.py` | 3 — add `MODE`/`KCODE` via MontePy |
+| `src/montepy_sweep.py` | 4 — parameter sweep over a deck |
+| `src/export_mcnp.py` | any model: translate + remediate + validate, the path Studio uses |
+| `src/remediate_deck.py` | remediation for both `make_runnable_deck.py` and `export_mcnp.py`; also the deck's comment cards |
+| `src/mcnp_cards.py` | SDEF/KCODE/tally cards from OpenMC objects; S(a,b) and FM reaction maps; `NONU` |
+| `src/lattice_cards.py` | `LAT=1`/`LAT=2` cells, FILL arrays, and the OpenMC→MCNP element index map |
+| `src/macrobody_cards.py` | standalone boxes and cylinders as `RPP`/`RCC` |
+| `src/validate_deck.py` | validation for any deck: cards, tallies, sources, geometry |
+| `src/geometry_check.py` | sampled-point geometry comparison against OpenMC, plus the tally-chain and current-face checks |
+| `src/deck_format.py` | 128-column limits |
 
-`references/` holds copies of `src/`; after changing a script in `src/`, copy it here too.
+This skill used to keep copies of these files in `references/`. They drifted several features behind the
+code that actually runs (`mcnp_cards.py` was 313 lines against 804 in `src/`), so an agent reading them got
+obsolete APIs and could "restore" behaviour that had been deliberately changed. The copies are gone: read
+`src/`, which is the only version that is ever run or tested.
 
 Verify a signature against the installed version before assuming a call matches — these scripts
 were written against MCNPy 0.0.7 and MontePy 1.1.3, and `inspect.signature()` or reading the
