@@ -142,6 +142,12 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
     else:
         cards.append(mcnp_cards.mode_card(settings))
         cards += mcnp_cards.fixed_source_cards(settings)
+    nonu = mcnp_cards.nonu_card(settings)
+    if nonu:
+        cards.append(nonu)
+        report["notes"].append("Fission is treated as capture (NONU, manual p. 319), as the OpenMC model sets "
+                               "create_fission_neutrons = False. MCNP still produces fission gammas; OpenMC's "
+                               "flag stops fission neutrons only, so the two differ if photons are transported.")
     t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry, model.materials, detector_responses,
                                               lattice_maps)
     report["notes"] += t_notes
@@ -322,6 +328,11 @@ def decorate_deck(text, model, graveyard_id=None):
         if m_mt:
             mid = int(m_mt.group(1))
             new_b2.append(f"c MT{mid}: Thermal neutron scattering S(alpha, beta) for Material {mid}")
+            new_b2.append(line)
+            continue
+
+        if head == "NONU":
+            new_b2.append("c NONU: fission is treated as capture, so no fission neutrons are made")
             new_b2.append(line)
             continue
 

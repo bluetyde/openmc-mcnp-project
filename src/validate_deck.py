@@ -336,6 +336,17 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
             if no_imp_p:
                 errors.append(f"MODE includes photons but cells {no_imp_p[:10]} have no IMP:P.")
 
+    # 2b. NONU must match the model's create_fission_neutrons
+    if model is not None:
+        wants_nonu = getattr(model.settings, "create_fission_neutrons", None) is False
+        has_nonu = starts("NONU")
+        if wants_nonu and not has_nonu:
+            errors.append("The OpenMC model sets create_fission_neutrons = False (fission as capture) but the "
+                          "deck has no NONU card, so MCNP would make fission neutrons.")
+        elif has_nonu and not wants_nonu:
+            errors.append("The deck has a NONU card (fission as capture) but the OpenMC model makes fission "
+                          "neutrons, so the two would not agree.")
+
     # 2. run control
     has_kcode, has_ksrc, has_sdef, has_nps = starts("KCODE"), starts("KSRC"), starts("SDEF"), starts("NPS")
     run_mode = model.settings.run_mode if model is not None else None

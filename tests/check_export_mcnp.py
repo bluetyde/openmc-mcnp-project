@@ -18,6 +18,8 @@ Self-test for src/export_mcnp.py and src/validate_deck.py.
 8. Exports several independent sources as one SDEF (ERG picks the source, the rest depends on it) for point +
    sphere, point + box and point + cylinder mixes, refuses two different volume shapes, and breaks the cards
    (positions swapped, strengths, energy order, radius order, particle).
+10. Exports `create_fission_neutrons = False` as NONU (fission as capture), checks the deck and the model agree
+   both ways, and refuses it in an eigenvalue run.
 
 Run from the project root, in the openmc-mcnp env:
     python tests/check_export_mcnp.py
@@ -379,6 +381,32 @@ def shared_face_box_model():
     settings = openmc.Settings(run_mode="fixed source", particles=1000, batches=5, seed=1)
     settings.source = openmc.IndependentSource(space=openmc.stats.Point((0, 0, 0)))
     return openmc.Model(openmc.Geometry(cells), openmc.Materials([steel, water]), settings)
+
+
+def fission_off_model(fission_neutrons=False, eigen=False):
+    """A fixed-source HEU sphere: multiplying enough that OpenMC's fixed-source mode needs fission treated as
+    capture (create_fission_neutrons = False, MCNP's NONU)."""
+    openmc.reset_auto_ids()
+    heu = openmc.Material(name="HEU")
+    heu.set_density("g/cm3", 18.7)
+    heu.add_nuclide("U235", 0.9, "wo")
+    heu.add_nuclide("U238", 0.1, "wo")
+    ball = openmc.Sphere(r=5.0)
+    world = _world(15.0)
+    cells = [openmc.Cell(name="Fuel", fill=heu, region=-ball & world),
+             openmc.Cell(name="World", region=world & +ball)]
+    settings = openmc.Settings(run_mode="eigenvalue" if eigen else "fixed source", particles=500, batches=5, seed=1)
+    settings.source = openmc.IndependentSource(space=openmc.stats.Point((0.0, 0.0, 0.0)))
+    if eigen:
+        settings.inactive = 2
+    if not fission_neutrons:
+        settings.create_fission_neutrons = False
+    model = openmc.Model(openmc.Geometry(cells), openmc.Materials([heu]), settings)
+    t = openmc.Tally(name="fuel flux")
+    t.filters = [openmc.CellFilter([cells[0]])]
+    t.scores = ["flux"]
+    model.tallies = openmc.Tallies([t])
+    return model
 
 
 def export_model(model, work, name):
@@ -826,6 +854,25 @@ def main():
             check(False, f"sources: more than {MAX_DIST} distributions refused")
         except UnsupportedFeature as e:
             check(str(MAX_DIST) in str(e), f"sources: more than {MAX_DIST} distributions refused (MCNP's limit)")
+
+        print("10. Fission as capture (NONU)")
+        r = export_model(fission_off_model(), work, "nonu")
+        ntext = open(r["runnable"]).read()
+        nmodel = load_model(os.path.join(work, "nonu", "model.xml"))
+        check(r["ok"], "NONU: deck with fission as capture validates")
+        check(re.search(r"^NONU$", ntext, re.M) is not None, "NONU: a bare NONU card is written (capture in every cell)")
+        check(any("treated as capture" in n for n in r.get("notes", [])), "NONU: the note says fission is capture and how MCNP differs on gammas")
+        ok, out = validate_text(re.sub(r"^NONU\n", "", ntext, count=1, flags=re.M), nmodel, work)
+        check(not ok and "no NONU card" in out, "[NONU: card removed] rejected")
+        base_fix = open(reports["fixed"]["runnable"]).read()
+        fix_model = load_model(os.path.join(work, "fixed", "model.xml"))
+        ok, out = validate_text(base_fix.replace("MODE N", "MODE N\nNONU", 1), fix_model, work)
+        check(not ok and "makes fission neutrons" in out, "[NONU: card on a model that keeps fission] rejected")
+        try:
+            export_model(fission_off_model(eigen=True), work, "nonu_eig")
+            check(False, "NONU: eigenvalue with fission off refused")
+        except UnsupportedFeature as e:
+            check("KCODE needs fission neutrons" in str(e), "NONU: eigenvalue with fission off refused with reason")
 
         print("3. Unsupported features are refused")
         try:

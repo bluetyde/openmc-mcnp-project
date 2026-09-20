@@ -137,6 +137,22 @@ def mode_card(settings, tallies=None):
     return "MODE N P" if uses_photons(settings, tallies) else "MODE N"
 
 
+def nonu_card(settings):
+    """NONU when the OpenMC model turns fission neutrons off (`settings.create_fission_neutrons = False`).
+
+    A NONU card with no entries makes MCNP treat fission as capture in every cell, with fission gammas still
+    produced (manual 5.6.7, p. 319; absent means real fission). OpenMC's flag stops fission neutrons only, so
+    the two agree for neutron transport; with photons on, MCNP still makes the fission gammas. Returns the card
+    or None."""
+    if getattr(settings, "create_fission_neutrons", None) is not False:
+        return None
+    if settings.run_mode == "eigenvalue":
+        raise UnsupportedFeature("The model sets create_fission_neutrons = False in an eigenvalue run, but "
+                                 "KCODE needs fission neutrons to make each generation. Use a fixed source, or "
+                                 "leave fission neutrons on.")
+    return "NONU"
+
+
 def _sources(settings):
     src = settings.source
     if src is None:
