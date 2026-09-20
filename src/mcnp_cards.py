@@ -213,6 +213,11 @@ def _energy(dist, dists):
         else:
             sp_vals = probs
         return dists.add("H " + " ".join(edges), "D " + " ".join(sp_vals))
+    if isinstance(dist, openmc.stats.Normal):
+        # MCNP SP -4 a b: Gaussian p(E) ~ exp(-((E-b)/a)^2), where b = mean (MeV), a = sqrt(2)*sigma (MeV)
+        b_mev = dist.mean_value / 1e6
+        a_mev = math.sqrt(2) * dist.std_dev / 1e6
+        return dists.add(None, f"-4 {num(a_mev)} {num(b_mev)}")
     raise UnsupportedFeature(f"Source energy distribution {type(dist).__name__} isn't supported.")
 
 

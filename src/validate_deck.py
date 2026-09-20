@@ -22,6 +22,7 @@ With no --model, the model is read from geometry.xml/materials.xml/settings.xml(
 in the current folder when they exist.
 """
 import argparse
+import math
 import os
 import re
 import sys
@@ -224,6 +225,11 @@ def _check_sources(raw_text, sources):
             ok = opt == "H" and _close_all(vals, [en.a / 1e6, en.b / 1e6]) and _close_all(probs, [0, 1])
         elif isinstance(en, openmc.stats.Tabular):
             ok = opt == "H" and _close_all(vals, [x / 1e6 for x in en.x])
+        elif isinstance(en, openmc.stats.Normal):
+            # MCNP SP -4 a b: a = sqrt(2)*sigma (MeV), b = mean (MeV)
+            a_mev = math.sqrt(2) * en.std_dev / 1e6
+            b_mev = en.mean_value / 1e6
+            ok = not vals and _close_all(probs, [-4, a_mev, b_mev])
         if not ok:
             errors.append(f"{tag}: energy {type(en).__name__} in OpenMC doesn't match distribution {e} "
                           f"(SI {opt} {vals}, SP {probs}).")

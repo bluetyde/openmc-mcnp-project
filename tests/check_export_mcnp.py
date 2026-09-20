@@ -27,6 +27,7 @@ Exit code 0 means every assertion held.
 """
 import contextlib
 import io
+import math
 import os
 import re
 import shutil
@@ -873,6 +874,42 @@ def main():
             check(False, "NONU: eigenvalue with fission off refused")
         except UnsupportedFeature as e:
             check("KCODE needs fission neutrons" in str(e), "NONU: eigenvalue with fission off refused with reason")
+
+        print("11. Normal / Gaussian energy distribution (SP -4) and Fusion Muir spectrum")
+        dt_energy = openmc.stats.muir(e0=14080000.0, m_rat=5.0, kt=20000.0)
+        # 1. Multi-source with Normal and Discrete lines: exercises _check_sources and Normal validation
+        dt_m = shielding_model()
+        dt_m.settings.source = [
+            openmc.IndependentSource(space=openmc.stats.Point((0, 0, 0)), energy=dt_energy, strength=1.0),
+            openmc.IndependentSource(space=openmc.stats.Point((1, 0, 0)), energy=openmc.stats.Discrete([2.45e6], [1.0]), strength=2.0)
+        ]
+        dt_rep = export_model(dt_m, work, "dt_fusion")
+        check(dt_rep["ok"], "D-T fusion multi-source: exported deck validates")
+        check("2 sources read back from the SDEF match OpenMC's" in dt_rep["validation"],
+              "D-T fusion multi-source: validator read back and matched Normal energy distribution")
+        dt_text = open(dt_rep["runnable"]).read()
+        check(re.search(r"SP\d+\s+-4\s+[0-9.]+\s+14\.08", dt_text) is not None,
+              "D-T fusion multi-source: SP -4 Gaussian card written correctly")
+        dt_model = load_model(os.path.join(work, "dt_fusion", "model.xml"))
+        # Mutate peak energy in the SP -4 card
+        dt_mut = re.sub(r"(SP\d+\s+-4\s+[0-9.]+\s+)14\.08", r"\g<1>15.0", dt_text)
+        ok, out = validate_text(dt_mut, dt_model, work)
+        check(dt_mut != dt_text and not ok and "energy Normal in OpenMC doesn't match distribution" in out,
+              "[D-T fusion: peak energy perturbed] rejected by validator")
+        # Mutate width parameter a
+        dt_mut2 = re.sub(r"(SP\d+\s+-4\s+)[0-9.]+(\s+14\.08)", r"\g<1>0.999\g<2>", dt_text)
+        ok, out = validate_text(dt_mut2, dt_model, work)
+        check(dt_mut2 != dt_text and not ok and "energy Normal in OpenMC doesn't match distribution" in out,
+              "[D-T fusion: width parameter perturbed] rejected by validator")
+
+        # 2. Single-source D-T fusion export
+        dt_single = shielding_model()
+        dt_single.settings.source = [openmc.IndependentSource(space=openmc.stats.Point((0, 0, 0)), energy=dt_energy)]
+        dt_s_rep = export_model(dt_single, work, "dt_single")
+        check(dt_s_rep["ok"], "single D-T fusion source: exported deck validates")
+        dt_s_text = open(dt_s_rep["runnable"]).read()
+        check(re.search(r"SP1\s+-4\s+[0-9.]+\s+14\.08", dt_s_text) is not None,
+              "single D-T fusion source: SP1 -4 card written correctly")
 
         print("3. Unsupported features are refused")
         try:
