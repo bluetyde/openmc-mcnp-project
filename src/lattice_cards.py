@@ -317,7 +317,7 @@ def rewrite(blocks, model, index_maps=None):
         else:
             lat_type, planes, lo, hi, ids, single, origin, desc, index = _hex_layout(lat, filled)
         if index_maps is not None:
-            index_maps[L] = {"cell": num, "index": index}
+            index_maps[L] = {"cell": num, "index": index, "surfaces": list(range(next_surf, next_surf + len(planes)))}
 
         region = []
         for kind, params, sense in planes:

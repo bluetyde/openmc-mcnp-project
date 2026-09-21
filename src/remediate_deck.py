@@ -91,7 +91,7 @@ def _graveyard_card(number, cell_ids):
     return "\n".join(lines)
 
 
-def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=None, simplify_macrobodies=True):
+def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=None, simplify_macrobodies=True, studio_ids=None):
     """Write a runnable deck to out_deck. Returns a report dict of what was added."""
     sab = dict(mcnp_cards.SAB_MCNP_MAP)
     sab.update(sab_map or {})
@@ -148,8 +148,9 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
         report["notes"].append("Fission is treated as capture (NONU, manual p. 319), as the OpenMC model sets "
                                "create_fission_neutrons = False. MCNP still produces fission gammas; OpenMC's "
                                "flag stops fission neutrons only, so the two differ if photons are transported.")
+    tally_map = {}
     t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry, model.materials, detector_responses,
-                                              lattice_maps)
+                                              lattice_maps, id_map=tally_map)
     report["notes"] += t_notes
     report["added"] += [c.split("\n")[0] for c in cards + t_cards]
 
@@ -191,6 +192,9 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
         if t_cards:
             deck_text = deck_text.rstrip("\n") + "\n" + "\n".join(t_cards) + "\n"
         deck_text = decorate_deck(deck_text, model, graveyard_id=graveyard)
+        if studio_ids is not None:
+            from studio_ids import annotate
+            deck_text = annotate(deck_text, studio_ids, lattice_maps, tally_map, graveyard)
         with open(out_deck, "w") as f:
             f.write(format_deck(deck_text))
     finally:

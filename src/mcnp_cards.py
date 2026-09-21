@@ -696,7 +696,7 @@ def _e_card(t, energy_f, notes):
     return " ".join(num(e / 1e6) for e in edges[1:])
 
 
-def tally_cards(tallies, geometry, materials=None, detector_responses=None, lattices=None):
+def tally_cards(tallies, geometry, materials=None, detector_responses=None, lattices=None, id_map=None):
     """F4/E4/FM/SD for cell tallies and FMESH for regular-mesh tallies.
 
     Returns (cards, notes). Cell tallies get SD=1 so MCNP reports volume-integrated
@@ -737,7 +737,11 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
                 raise UnsupportedFeature(f"Tally '{t.name}': a current tally needs a SurfaceFilter (a CellFromFilter "
                                          f"and an EnergyFilter are optional), only the score 'current', and no cell, "
                                          f"mesh or detector filter.")
+            old_k = k
             new, k = _current_cards(t, geometry, _e_card(t, energy_f, notes), k, notes)
+            if id_map is not None:
+                for index in range(old_k, k):
+                    id_map[index * 10 + 1] = t.id
             cards += new
             continue
         if sum(f is not None for f in (cell_f, inst_f, mesh_f)) != 1:
@@ -756,6 +760,8 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
 
         for score in t.scores:
             n = 10 * k + 4
+            if id_map is not None:
+                id_map[n] = t.id
             k += 1
             label = f"{t.name or 'tally ' + str(t.id)} ({score})"
             if score != "flux" and score not in SCORE_FM:
