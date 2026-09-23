@@ -43,3 +43,9 @@ boundaries; photon transport; cell tallies (flux and reaction rates) and regular
 and cylinders (general P and GQ surfaces).
 Anything else is refused with a reason instead of being exported approximately.
 
+## License
+
+Original code in this repository is licensed under the [MIT License](LICENSE).
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for OpenMC and NuCoMP
+MCNPy/MetaPy notices. External dependencies and third-party data retain their
+own licenses; this license does not grant rights to MCNP itself.
