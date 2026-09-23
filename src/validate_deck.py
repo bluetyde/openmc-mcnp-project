@@ -542,6 +542,9 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
                                   f"points as their OpenMC cell instances")
                 for label in g["unhit_chains"]:
                     print(f"WARNING: {label}: no sampled point fell in it, so it wasn't compared with OpenMC.")
+                for cid, name in g["unsampled_cells"]:
+                    print(f"WARNING: cell {cid} ({name}): no sampled point fell in it, so its geometry wasn't "
+                          f"compared with OpenMC (the pass above covers the rest of the model).")
         elif chains:
             print("WARNING: lattice tally bins weren't compared with OpenMC (run with geometry samples to check them).")
         if geometry_samples and faces:

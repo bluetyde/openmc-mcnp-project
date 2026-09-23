@@ -576,9 +576,14 @@ def chain_text(chain):
 
 
 def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345, chains=None):
-    """Return dict(ok, checked_points, errors, skipped_near_surface, reason, unhit_chains)."""
+    """Return dict(ok, checked_points, errors, skipped_near_surface, reason, unhit_chains, unsampled_cells).
+
+    unsampled_cells lists the material/void cells no sample point landed in. Their geometry was NOT
+    compared: OpenMC can't bound a region made of tilted planes or quadrics, so such a cell's "box" is
+    the whole domain, and a small cell in a large world can get no points at all. A pass with
+    unsampled cells is a pass for the rest of the model only, and callers must say so."""
     result = {"ok": False, "checked_points": 0, "errors": [], "skipped_near_surface": 0, "reason": None,
-              "unhit_chains": []}
+              "unhit_chains": [], "unsampled_cells": []}
     try:
         deck = _Deck(problem)
     except NotCheckable as e:
@@ -618,9 +623,12 @@ def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345,
         if len(errors) < 20:
             errors.append(msg)
 
+    cell_hits = {}
     for pi, (p, n) in enumerate(zip(P, leaf)):
         found = geometry.find(tuple(p))
         omc_cell = found[-1] if found and isinstance(found[-1], openmc.Cell) else None
+        if omc_cell is not None:
+            cell_hits[omc_cell.id] = cell_hits.get(omc_cell.id, 0) + 1
         where = f"({p[0]:.4g}, {p[1]:.4g}, {p[2]:.4g})"
         if chains:
             bm, bo = by_chain.get(paths[pi]), by_path.get(_openmc_path(found))
@@ -645,6 +653,10 @@ def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345,
         elif mcnp.number != omc_cell.id:
             add(f"point {where}: OpenMC cell {omc_cell.id} ({omc_cell.name}) but MCNP cell {mcnp.number}")
     result["checked_points"] = int(len(P))
+    result["cell_hits"] = cell_hits
+    result["unsampled_cells"] = sorted(
+        (cid, c.name) for cid, c in geometry.get_all_cells().items()
+        if (c.fill is None or isinstance(c.fill, openmc.Material)) and not cell_hits.get(cid))
     if chains:
         result["unhit_chains"] = [chains[b][0] for b in range(len(chains)) if not hits[b]]
 
