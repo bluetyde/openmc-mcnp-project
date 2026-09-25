@@ -696,8 +696,40 @@ def _e_card(t, energy_f, notes):
     return " ".join(num(e / 1e6) for e in edges[1:])
 
 
-def tally_cards(tallies, geometry, materials=None, detector_responses=None, lattices=None, id_map=None):
+def _dose_cards(n, t, energy_fn_f, dose, meta):
+    """DE/DF for an OpenMC Studio dose tally, from the tally's own energy function.
+
+    The table is the one OpenMC used (ICRP coefficients in pSv cm^2, padded by Studio down to the lowest
+    transported energy), written LOG LOG as OpenMC interpolates it (manual p. 465). MCNP holds the end values
+    outside the table; the padding makes OpenMC do the same. Returns (DE/DF cards, rate factor or None, unit).
+    """
+    if energy_fn_f is None:
+        raise UnsupportedFeature(f"Tally '{t.name}': a dose tally needs its EnergyFunctionFilter.")
+    if energy_fn_f.interpolation != "log-log":
+        raise UnsupportedFeature(f"Tally '{t.name}': dose tables are written LOG LOG, but this one interpolates "
+                                 f"{energy_fn_f.interpolation}.")
+    # LOG LOG is MCNP's default for DE/DF (p. 465), and MontePy 1.1.3 can't parse the LOG keyword, so it's
+    # left implicit and said in a comment.
+    cards = [f"c DE{n}/DF{n}: {meta['data'].upper()} {meta['geometry']} dose coefficients (pSv cm2), log-log",
+             _bin_card(f"DE{n}", [num(float(f"{e / 1e6:.12g}")) for e in energy_fn_f.energy]),
+             _bin_card(f"DF{n}", [num(y) for y in energy_fn_f.y])]
+    rate = (dose or {}).get("source_rate")
+    factor = rate * 3600e-12 if rate else None  # particles/s x s/h x Sv/pSv
+    return cards, factor, "Sv/h" if rate else "pSv per source particle"
+
+
+def _dose_meta(dose, t):
+    tallies = (dose or {}).get("tallies") or {}
+    return tallies.get(t.id) or tallies.get(str(t.id))
+
+
+def tally_cards(tallies, geometry, materials=None, detector_responses=None, lattices=None, id_map=None, dose=None):
     """F4/E4/FM/SD for cell tallies and FMESH for regular-mesh tallies.
+
+    `dose` is OpenMC Studio's dose description ({"tallies": {tally id: {particle, data, geometry, ...}},
+    "volumes": {cell id: [volume, error]}, "source_rate": particles/s or None}). A dose tally gets DE/DF from
+    its energy function, SD with Studio's cell volume (so both codes divide by the same number), and the source
+    rate as FM (cells) or FACTOR (FMESH), so the deck reports Sv/h.
 
     Returns (cards, notes). Cell tallies get SD=1 so MCNP reports volume-integrated
     values like OpenMC (MCNP's F4 divides by volume by default). One MCNP tally per
@@ -712,6 +744,7 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
         if t.nuclides and list(t.nuclides) != ["total"]:
             raise UnsupportedFeature(f"Tally '{t.name}': per-nuclide tallies aren't supported.")
         cell_f = inst_f = energy_f = mesh_f = energy_fn_f = surf_f = from_f = None
+        ptag = "N"
         for f in t.filters:
             if isinstance(f, openmc.CellFilter):
                 cell_f = f
@@ -721,8 +754,8 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
                 energy_f = f
             elif isinstance(f, openmc.MeshFilter):
                 mesh_f = f
-            elif isinstance(f, openmc.ParticleFilter) and list(f.bins) == ["neutron"]:
-                pass
+            elif isinstance(f, openmc.ParticleFilter) and list(f.bins) in (["neutron"], ["photon"]):
+                ptag = "P" if list(f.bins) == ["photon"] else "N"
             elif isinstance(f, openmc.EnergyFunctionFilter):
                 energy_fn_f = f
             elif isinstance(f, openmc.SurfaceFilter):
@@ -746,6 +779,12 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
             continue
         if sum(f is not None for f in (cell_f, inst_f, mesh_f)) != 1:
             raise UnsupportedFeature(f"Tally '{t.name}': needs exactly one CellFilter, CellInstanceFilter or MeshFilter.")
+        if ptag == "P" and list(t.scores) != ["flux"]:
+            raise UnsupportedFeature(f"Tally '{t.name}': photon tallies support only 'flux'.")
+        dmeta = _dose_meta(dose, t)
+        if dmeta is not None and (list(t.scores) != ["flux"] or inst_f is not None or energy_f is not None):
+            raise UnsupportedFeature(f"Tally '{t.name}': a dose tally scores flux on cells or a mesh, without "
+                                     f"lattice-instance or energy bins.")
         bins = None  # [(MCNP bin text, openmc cell)]
         if cell_f is not None:
             ids = [int(c) for c in cell_f.bins]
@@ -767,8 +806,28 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
             if score != "flux" and score not in SCORE_FM:
                 raise UnsupportedFeature(f"Tally '{t.name}': score '{score}' isn't supported "
                                          f"(supported: flux, {', '.join(SCORE_FM)}).")
+            if bins is not None and dmeta is not None:
+                de_df, factor, unit = _dose_cards(n, t, energy_fn_f, dose, dmeta)
+                vols = (dose or {}).get("volumes") or {}
+                sd = []
+                for b, c in bins:
+                    v = vols.get(str(c.id)) or vols.get(c.id)
+                    if not v:
+                        raise UnsupportedFeature(f"Tally '{t.name}': no volume for cell {c.id}. Export it from OpenMC "
+                                                 f"Studio, which measures dose cells with OpenMC's volume calculation.")
+                    sd.append(num(v[0]))
+                cards.append(_bin_card(f"F{n}:{ptag}", [b for b, _ in bins]))
+                cards.append(f"FC{n} {dmeta.get('name') or t.name}: {dmeta['particle']} effective dose, {unit} "
+                             f"({dmeta['data'].upper()} {dmeta['geometry']})")
+                cards += de_df
+                if factor:
+                    cards.append(f"FM{n} {num(factor)}")
+                cards.append(_bin_card(f"SD{n}", sd))
+                notes.append(f"Tally '{t.name}' (F{n}:{ptag}): effective dose from DE/DF (the same table OpenMC used), "
+                             f"divided by Studio's cell volume (SD), in {unit}.")
+                continue
             if bins is not None:
-                cards.append(_bin_card(f"F{n}:N", [b for b, _ in bins]))
+                cards.append(_bin_card(f"F{n}:{ptag}", [b for b, _ in bins]))
                 cards.append(f"FC{n} {label}")
                 if score != "flux":
                     mats = {c.fill.id if isinstance(c.fill, openmc.Material) else None for _, c in bins}
@@ -803,6 +862,19 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
                             f"\n     KMESH={num(hi[2])} KINTS={int(nz)}")
                 else:
                     raise UnsupportedFeature(f"Tally '{t.name}': only 3D RegularMesh and CylindricalMesh are supported.")
+                if ptag == "P":
+                    card = card.replace(f"FMESH{n}:N", f"FMESH{n}:P", 1)
+                if dmeta is not None:
+                    de_df, factor, unit = _dose_cards(n, t, energy_fn_f, dose, dmeta)
+                    if factor:
+                        card += f"\n     FACTOR={num(factor)}"
+                    cards.append(card)
+                    cards.append(f"FC{n} {dmeta.get('name') or t.name}: {dmeta['particle']} effective dose map, {unit} "
+                                 f"({dmeta['data'].upper()} {dmeta['geometry']})")
+                    cards += de_df
+                    notes.append(f"Tally '{t.name}' (FMESH{n}:{ptag}): effective dose per voxel from DE/DF, in {unit}; "
+                                 f"MCNP divides by the voxel volume, as Studio's dose map does.")
+                    continue
                 if energy_fn_f is not None:
                     fm, note = _detector_fm(t, materials, detector_responses)
                     card += f"\n     FM={fm}"

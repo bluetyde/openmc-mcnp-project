@@ -44,7 +44,7 @@ def translate(model, out_path, stdout=None):
     return notes
 
 
-def export(model_path, out_dir=None, name=None, sab=None, samples=20000, macrobodies=True):
+def export(model_path, out_dir=None, name=None, sab=None, samples=20000, macrobodies=True, dose=None):
     report = {"ok": False, "model": os.path.abspath(model_path), "stage": "load"}
     model = load_model(model_path)
     base = os.path.dirname(os.path.abspath(model_path)) if not os.path.isdir(model_path) else os.path.abspath(model_path)
@@ -59,7 +59,7 @@ def export(model_path, out_dir=None, name=None, sab=None, samples=20000, macrobo
     prep_notes = translate(model, translated)
 
     report["stage"] = "remediate"
-    report.update(remediate(translated, model, runnable, sab_map=sab, simplify_macrobodies=macrobodies))
+    report.update(remediate(translated, model, runnable, sab_map=sab, simplify_macrobodies=macrobodies, dose=dose))
     report["notes"] = prep_notes + report.get("notes", [])
 
     report["stage"] = "validate"
@@ -83,6 +83,8 @@ def main(argv=None):
     ap.add_argument("--no-macrobodies", dest="macrobodies", action="store_false", default=True,
                     help="disable standalone macrobody simplification (RPP, RCC)")
     ap.add_argument("--report", help="write a JSON report here")
+    ap.add_argument("--dose", help="OpenMC Studio's dose.json (written next to a run's model.py): dose tallies, "
+                                   "cell volumes and the source rate, for DE/DF/SD/FM cards")
     args = ap.parse_args(argv)
 
     sab = {}
@@ -93,7 +95,11 @@ def main(argv=None):
         sab[k.strip()] = v.strip()
 
     try:
-        report = export(args.model, args.out_dir, args.name, sab, args.samples, macrobodies=args.macrobodies)
+        dose = None
+        if args.dose:
+            with open(args.dose, encoding="utf-8") as f:
+                dose = json.load(f)
+        report = export(args.model, args.out_dir, args.name, sab, args.samples, macrobodies=args.macrobodies, dose=dose)
     except UnsupportedFeature as e:
         report = {"ok": False, "stage": "remediate", "error": f"Not exportable: {e}"}
     except Exception as e:

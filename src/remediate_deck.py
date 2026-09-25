@@ -91,7 +91,8 @@ def _graveyard_card(number, cell_ids):
     return "\n".join(lines)
 
 
-def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=None, simplify_macrobodies=True, studio_ids=None):
+def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=None, simplify_macrobodies=True, studio_ids=None,
+              dose=None):
     """Write a runnable deck to out_deck. Returns a report dict of what was added."""
     sab = dict(mcnp_cards.SAB_MCNP_MAP)
     sab.update(sab_map or {})
@@ -150,7 +151,7 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
                                "flag stops fission neutrons only, so the two differ if photons are transported.")
     tally_map = {}
     t_cards, t_notes = mcnp_cards.tally_cards(model.tallies, geometry, model.materials, detector_responses,
-                                              lattice_maps, id_map=tally_map)
+                                              lattice_maps, id_map=tally_map, dose=dose)
     report["notes"] += t_notes
     report["added"] += [c.split("\n")[0] for c in cards + t_cards]
 

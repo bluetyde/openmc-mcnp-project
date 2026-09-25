@@ -23,6 +23,10 @@ Anything that can't be translated faithfully is refused with a reason instead of
 - **Tallies**: cell flux and reaction rates (`F4`), detector responses as `FM` multipliers, energy bins (`E`),
   regular and cylindrical meshes (`FMESH`), tallies on parts inside a lattice (chains through the lattice),
   and surface currents (`F1` with `C 0 1` and `FS` to pick the face).
+- **Dose rates** from OpenMC Studio: effective dose (ICRP-116 or ICRP-74) on cells (`F4:N`, `F4:P`) and
+  meshes (`FMESH`), with `DE`/`DF` carrying exactly the table OpenMC used, `SD` with the cell volume Studio
+  measured (so both codes divide by one volume), and the source rate as `FM` or `FACTOR`, so the deck prints
+  Sv/h. From the command line, pass a Studio run's `dose.json` with `--dose`.
 - **Readable decks**: section comments, lines wrapped within MCNP's 128 columns, and optional comments that
   link each card back to the Studio object it came from (`docs/studio-ids.md`).
 
@@ -67,6 +71,7 @@ https://openmc.org/data/).
 python src/export_mcnp.py path/to/model.xml --name mymodel         # or a folder with the XML files
 python src/export_mcnp.py model.xml --sab c_H_in_H2O=h-h2o.40t      # override an S(a,b) name for your xsdir
 python src/validate_deck.py deck.mcnp --model model.xml             # check an existing deck against its model
+python src/export_mcnp.py model.xml --dose dose.json                  # a Studio run folder: dose tallies too
 ```
 
 This writes `<name>.mcnp` (MCNPy's translation) and `<name>_runnable.mcnp` (the deck to run), and exits
@@ -85,6 +90,7 @@ python tests/test_geometry_coverage.py   # small rotated cells are sampled, and 
 python tests/test_deck_format.py         # 128-column wrapping
 python tests/test_studio_ids.py          # Studio ID comments survive a round trip
 python tests/test_column_export.py       # a real translation stays within 128 columns (needs MCNPy)
+python tests/test_dose_export.py         # dose cards: DE/DF numbers, SD volume, rate factor, photon F4:P (needs MCNPy)
 ```
 
 MCNPy's Java bridge listens on a fixed port (25333), so run one export at a time on a machine.
