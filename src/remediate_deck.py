@@ -103,6 +103,8 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
 
     base_text = open(source_deck, "r").read().strip()
     blocks = base_text.split("\n\n")
+    if len(blocks) == 2:  # a model with no materials (everything void): MCNPy writes no data block at all
+        blocks.append("")
     if len(blocks) < 3:
         raise ValueError(f"{source_deck} doesn't have cell, surface and data blocks separated by blank lines.")
 
@@ -157,7 +159,11 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
 
     # tallies go on after MontePy has written the deck: MontePy 1.1.3 can't parse tally chains
     # (1 < 7[0 0 0] < 3), and it has nothing to change in the tally cards
-    augmented = "\n\n".join(blocks).strip() + "\n" + "\n".join(cards) + "\n"
+    # cells, blank line, surfaces, blank line, data: the data block may be empty (a model with no materials), so
+    # the separator before it is written explicitly rather than left to strip()
+    data = "\n\n".join(blocks[2:]).strip()
+    augmented = (blocks[0].strip() + "\n\n" + blocks[1].strip() + "\n\n" + (data + "\n" if data else "")
+                 + "\n".join(cards) + "\n")
 
     fd, tmp = tempfile.mkstemp(suffix=".mcnp")
     try:
