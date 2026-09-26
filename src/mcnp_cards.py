@@ -738,7 +738,8 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
     """F4/E4/FM/SD for cell tallies and FMESH for regular-mesh tallies.
 
     `dose` is OpenMC Studio's dose description ({"tallies": {tally id: {particle, data, geometry, ...}},
-    "volumes": {cell id: [volume, error]}, "source_rate": particles/s or None}). A dose tally gets DE/DF from
+    "volumes": {cell id, or "cell/instance" for a lattice element: [volume, error]}, "source_rate": particles/s
+    or None}). A dose tally gets DE/DF from
     its energy function, SD with Studio's cell volume (so both codes divide by the same number), and the source
     rate as FM (cells) or FACTOR (FMESH), so the deck reports Sv/h.
 
@@ -793,18 +794,21 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
         if ptag == "P" and list(t.scores) != ["flux"]:
             raise UnsupportedFeature(f"Tally '{t.name}': photon tallies support only 'flux'.")
         dmeta = _dose_meta(dose, t)
-        if dmeta is not None and (list(t.scores) != ["flux"] or inst_f is not None or energy_f is not None):
+        if dmeta is not None and (list(t.scores) != ["flux"] or energy_f is not None):
             raise UnsupportedFeature(f"Tally '{t.name}': a dose tally scores flux on cells or a mesh, without "
-                                     f"lattice-instance or energy bins.")
+                                     f"energy bins.")
         bins = None  # [(MCNP bin text, openmc cell)]
+        vol_keys = None  # dose volumes are keyed by cell ID, or "cell/instance" for one lattice element
         if cell_f is not None:
             ids = [int(c) for c in cell_f.bins]
             missing = [c for c in ids if c not in cells]
             if missing:
                 raise UnsupportedFeature(f"Tally '{t.name}' refers to cells {missing} that aren't in the geometry.")
             bins = [(str(c), cells[c]) for c in ids]
+            vol_keys = [[str(c)] for c in ids]
         elif inst_f is not None:
             bins = _instance_bins(t, inst_f, geometry, lattices)
+            vol_keys = [[f"{int(c)}/{int(i)}", str(int(c))] for c, i in inst_f.bins]
 
         e_card = _e_card(t, energy_f, notes)
 
@@ -821,10 +825,10 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
                 de_df, factor, unit = _dose_cards(n, t, energy_fn_f, dose, dmeta)
                 vols = (dose or {}).get("volumes") or {}
                 sd = []
-                for b, c in bins:
-                    v = vols.get(str(c.id)) or vols.get(c.id)
+                for (b, c), keys in zip(bins, vol_keys):
+                    v = next((vols[k] for k in keys if vols.get(k)), None) or vols.get(c.id)
                     if not v:
-                        raise UnsupportedFeature(f"Tally '{t.name}': no volume for cell {c.id}. Export it from OpenMC "
+                        raise UnsupportedFeature(f"Tally '{t.name}': no volume for cell {keys[0]}. Export it from OpenMC "
                                                  f"Studio, which measures dose cells with OpenMC's volume calculation.")
                     sd.append(num(v[0]))
                 cards.append(_bin_card(f"F{n}:{ptag}", [b for b, _ in bins]))

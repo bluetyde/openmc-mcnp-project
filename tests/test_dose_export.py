@@ -170,5 +170,56 @@ class DoseExport(unittest.TestCase):
                 self.assertFalse(r["ok"])
                 self.assertIn("Not exportable", r["error"])
 
+def build_lattice(work):
+    """Two void pins in a 2 x 1 RectLattice inside a water tank; a dose tally on each pin (CellInstanceFilter)."""
+    openmc.reset_auto_ids()
+    water = openmc.Material(name="water")
+    water.add_element("H", 2)
+    water.add_element("O", 1)
+    water.set_density("g/cm3", 1.0)
+    pin = openmc.ZCylinder(r=1.0)
+    c_pin = openmc.Cell(name="pin", region=-pin)
+    c_mod = openmc.Cell(name="mod", fill=water, region=+pin)
+    u = openmc.Universe(cells=[c_pin, c_mod])
+    lat = openmc.RectLattice()
+    lat.lower_left, lat.pitch, lat.universes = (-4, -2), (4, 4), [[u, u]]
+    box = openmc.model.RectangularParallelepiped(-4, 4, -2, 2, -5, 5)
+    world = openmc.model.RectangularParallelepiped(-20, 20, -20, 20, -20, 20, boundary_type="vacuum")
+    c_lat = openmc.Cell(name="lattice", fill=lat, region=-box)
+    c_out = openmc.Cell(name="outside", fill=water, region=-world & +box)
+    geometry = openmc.Geometry([c_lat, c_out])
+    geometry.determine_paths()
+    s = openmc.Settings()
+    s.run_mode, s.batches, s.particles = "fixed source", 10, 1000
+    s.source = openmc.IndependentSource(space=openmc.stats.Point((0, 10, 0)), energy=openmc.stats.Discrete([14.1e6], [1]))
+    t = openmc.Tally(name="Pins [neutron dose]")
+    t.filters = [openmc.CellInstanceFilter([(c_pin, 0), (c_pin, 1)]), openmc.ParticleFilter(["neutron"]),
+                 dose_filter("neutron", 1e-5)]
+    t.scores = ["flux"]
+    model = openmc.Model(geometry, openmc.Materials([water]), s, openmc.Tallies([t]))
+    path = os.path.join(work, "model.xml")
+    model.export_to_model_xml(path)
+    dose = {"tallies": {str(t.id): {"studio": "t", "name": "Pins", "particle": "neutron", "data": "icrp116",
+                                    "geometry": "AP"}},
+            "volumes": {f"{c_pin.id}/0": [31.1, 0.1], f"{c_pin.id}/1": [31.7, 0.1]}, "source_rate": None}
+    return path, dose
+
+
+class DoseInLattice(unittest.TestCase):
+    """A dose tally on parts inside a lattice: chain bins, and each element's own volume on SD (keyed
+    "cell/instance" in Studio's dose description)."""
+
+    def test_chain_bins_carry_each_instance_volume(self):
+        work = tempfile.mkdtemp(prefix="dose-export-lat-")
+        path, dose = build_lattice(work)
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = export(path, os.path.join(work, "deck"), "lat", samples=2000, dose=dose)
+        deck = Path(report["runnable"]).read_text()
+        self.assertTrue(report["ok"], report.get("validation", "")[-2000:])
+        f4 = next(l for l in deck.splitlines() if l.startswith("F4:N"))
+        self.assertEqual(f4.count("<"), 4, f4)
+        self.assertEqual(numbers(deck, "SD4"), [31.1, 31.7])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
