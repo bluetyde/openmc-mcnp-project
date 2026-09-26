@@ -224,7 +224,9 @@ def _check_sources(raw_text, sources):
         elif isinstance(en, openmc.stats.Uniform):
             ok = opt == "H" and _close_all(vals, [en.a / 1e6, en.b / 1e6]) and _close_all(probs, [0, 1])
         elif isinstance(en, openmc.stats.Tabular):
-            ok = opt == "H" and _close_all(vals, [x / 1e6 for x in en.x])
+            from mcnp_cards import histogram_mass
+            ok = opt == "H" and _close_all(vals, [x / 1e6 for x in en.x]) and len(probs) == len(en.x) and \
+                probs[0] == 0 and sum(probs) > 0 and _close_all([v / sum(probs) for v in probs[1:]], histogram_mass(en))
         elif isinstance(en, openmc.stats.Normal):
             # MCNP SP -4 a b: a = sqrt(2)*sigma (MeV), b = mean (MeV)
             a_mev = math.sqrt(2) * en.std_dev / 1e6

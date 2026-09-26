@@ -188,6 +188,21 @@ def eigenvalue_cards(settings):
 
 # ── fixed source ───────────────────────────────────────────────────────────────
 
+def histogram_mass(dist):
+    """The probability of each bin of a histogram Tabular, as MCNP's SP D wants them (after its leading 0).
+
+    OpenMC's histogram p are densities (per eV) over [x[i], x[i+1]); p may have one value per edge, the last
+    unused. The mass of bin i is p[i] * (x[i+1] - x[i]); copying p straight across would reweight unequal bins."""
+    x, p = [float(e) for e in dist.x], [float(v) for v in dist.p]
+    if len(p) not in (len(x), len(x) - 1):
+        raise UnsupportedFeature(f"Tabular energy distribution has {len(x)} edges but {len(p)} probabilities.")
+    mass = [pi * (hi - lo) for pi, lo, hi in zip(p, x, x[1:])]
+    total = sum(mass)
+    if not total > 0:
+        raise UnsupportedFeature("Tabular energy distribution has no probability in any bin.")
+    return [float(f"{m / total:.12g}") for m in mass]
+
+
 def _energy(dist, dists):
     """Return the ERG= value (eV -> MeV)."""
     if dist is None:  # OpenMC's default source energy is a Watt spectrum with these parameters
@@ -206,13 +221,8 @@ def _energy(dist, dists):
     if isinstance(dist, openmc.stats.Tabular):
         if dist.interpolation != "histogram":
             raise UnsupportedFeature(f"Tabular energy distribution with interpolation '{dist.interpolation}' isn't supported (only 'histogram').")
-        edges = [num(e / 1e6) for e in dist.x]
-        probs = [num(p) for p in dist.p]
-        if len(probs) == len(edges) - 1:
-            sp_vals = ["0"] + probs
-        else:
-            sp_vals = probs
-        return dists.add("H " + " ".join(edges), "D " + " ".join(sp_vals))
+        x = [float(e) for e in dist.x]
+        return dists.add("H " + " ".join(num(e / 1e6) for e in x), "D " + " ".join(["0"] + [num(m) for m in histogram_mass(dist)]))
     if isinstance(dist, openmc.stats.Normal):
         # MCNP SP -4 a b: Gaussian p(E) ~ exp(-((E-b)/a)^2), where b = mean (MeV), a = sqrt(2)*sigma (MeV)
         b_mev = dist.mean_value / 1e6
@@ -649,7 +659,7 @@ def current_bins(t, geometry):
     return pairs, zero
 
 
-def _current_cards(t, geometry, e_card, k, notes):
+def _current_cards(t, geometry, e_card, k, notes, ptag="N"):
     """F1 + FC + C + FS (+ E) per bin of a current tally. The FC card ends with a tag the validator reads:
     [S s C c SEG a-b COS n X+1] = OpenMC's value is the sum of FS segments a-b in cosine bin n, times +1;
     [S s NET] = cosine bin 2 minus bin 1 (a SurfaceFilter with no CellFromFilter). Returns (cards, next k)."""
@@ -671,7 +681,7 @@ def _current_cards(t, geometry, e_card, k, notes):
             fs, segs, cos_bin, sign = patch
             seg = f"{segs[0]}-{segs[-1]}" if len(segs) > 1 else str(segs[0])
             tag = f"[S {s.id} C {c.id} SEG {seg} COS {cos_bin} X{sign:+d}]"
-        out += [f"F{n}:N {s.id}", f"FC{n} {name[:78 - 7 - len(tag)]} {tag}", f"C{n} 0 1"]
+        out += [f"F{n}:{ptag} {s.id}", f"FC{n} {name[:78 - 7 - len(tag)]} {tag}", f"C{n} 0 1"]
         if c is not None and fs:
             out.append(_bin_card(f"FS{n}", [("-" if sd == "-" else "") + str(surf.id) for surf, sd in fs]))
         if e_card:
@@ -690,9 +700,10 @@ def _e_card(t, energy_f, notes):
     if energy_f is None:
         return None
     edges = [float(e) for e in energy_f.values]
-    if edges[0] > 0:
-        notes.append(f"Tally '{t.name}': MCNP energy bins start at 0, so there is an extra "
-                     f"bin below {edges[0]:g} eV that OpenMC doesn't have.")
+    if edges[0] > 0:  # MCNP's first bin runs from 0 to the first E entry, so the lower edge is written as a bin
+        notes.append(f"Tally '{t.name}': MCNP energy bins start at 0, so its first bin (0 to {edges[0] / 1e6:g} MeV) "
+                     f"is extra: OpenMC's bin i is MCNP's bin i + 1.")
+        return " ".join(num(e / 1e6) for e in edges)
     return " ".join(num(e / 1e6) for e in edges[1:])
 
 
@@ -771,7 +782,7 @@ def tally_cards(tallies, geometry, materials=None, detector_responses=None, latt
                                          f"and an EnergyFilter are optional), only the score 'current', and no cell, "
                                          f"mesh or detector filter.")
             old_k = k
-            new, k = _current_cards(t, geometry, _e_card(t, energy_f, notes), k, notes)
+            new, k = _current_cards(t, geometry, _e_card(t, energy_f, notes), k, notes, ptag)
             if id_map is not None:
                 for index in range(old_k, k):
                     id_map[index * 10 + 1] = t.id

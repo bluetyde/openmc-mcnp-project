@@ -479,13 +479,28 @@ def main():
         tab_m = shielding_model()
         tab_m.settings.source = [openmc.IndependentSource(
             space=openmc.stats.Point((0, 0, 0)),
-            energy=openmc.stats.Tabular([0.0, 1e6, 2e6, 5e6], [0.2, 0.5, 0.3], interpolation="histogram")
+            # OpenMC histogram values are densities per eV; the bins hold 0.2, 0.5 and 0.3 of the source
+            energy=openmc.stats.Tabular([0.0, 1e6, 2e6, 5e6], [0.2e-6, 0.5e-6, 0.1e-6], interpolation="histogram")
         )]
         tab_rep = export_model(tab_m, work, "tabular")
         check(tab_rep["ok"], "tabular source: exported deck validates")
         tab_text = open(tab_rep["runnable"]).read()
         check("SI1 H 0.0 1.0 2.0 5.0" in tab_text and "SP1 D 0 0.2 0.5 0.3" in tab_text,
-              "tabular source: SI H and SP D cards written correctly")
+              "tabular source: SI H and SP D cards written correctly (bin probabilities, not densities)")
+        # the validator reads sources back from a multi-source SDEF: there, a spectrum whose SP holds the densities
+        # (as the old export wrote them) instead of the bin probabilities must be caught
+        tab2 = shielding_model()
+        tab2.settings.source = [
+            openmc.IndependentSource(space=openmc.stats.Point((0, 0, 0)), energy=openmc.stats.Tabular(
+                [0.0, 1e6, 2e6, 5e6], [0.2e-6, 0.5e-6, 0.1e-6], interpolation="histogram"), strength=1.0),
+            openmc.IndependentSource(space=openmc.stats.Point((1, 0, 0)), energy=openmc.stats.Discrete([2e6], [1.0]),
+                                     strength=1.0)]
+        tab2_rep = export_model(tab2, work, "tabular2")
+        tab2_text = open(tab2_rep["runnable"]).read()
+        check(tab2_rep["ok"] and re.search(r"^SP\d+ D 0 0\.2 0\.5 0\.3$", tab2_text, re.M) is not None,
+              "tabular source (two sources): exported deck validates, SP D holds bin probabilities")
+        ok, out = validate_text(re.sub(r"^(SP\d+ D 0 0\.2 0\.5) 0\.3$", r"\1 0.1", tab2_text, flags=re.M), tab2, work)
+        check(not ok and "Tabular" in out, "tabular source: densities copied as SP probabilities are reported")
 
         print("2. Each validator check fires on a broken deck")
         base_path = reports["fixed"]["runnable"]
