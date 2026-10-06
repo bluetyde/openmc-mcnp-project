@@ -23,6 +23,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import lattice_cards  # noqa: E402
+import world_complement  # noqa: E402
 from mcnp_cards import UnsupportedFeature  # noqa: E402
 from remediate_deck import load_model, remediate  # noqa: E402
 from validate_deck import validate_deck  # noqa: E402
@@ -38,9 +39,15 @@ def translate(model, out_path, stdout=None):
         raise RuntimeError("MCNPy is not importable in this environment. See CLAUDE.md 'MCNPy install notes'. "
                            f"Original error: {e}")
     notes = lattice_cards.prepare(model)
-    with contextlib.redirect_stdout(stdout if stdout is not None else io.StringIO()), lattice_cards.mcnpy_view(model):
+    wc = world_complement.plan(model.geometry)  # the rest-of-the-world cell, written as #cell complements below
+    with contextlib.redirect_stdout(stdout if stdout is not None else io.StringIO()), \
+            lattice_cards.mcnpy_view(model), world_complement.mcnpy_view(wc):
         deck = openmc_to_mcnp(model.geometry, model.materials, model.settings)
         deck.write(out_path)
+    if wc:
+        world_complement.patch_file(out_path, wc)
+        notes.append(f"Cell {wc['cell'].id} (outside the other cells) is written with {len(wc['ids'])} #cell "
+                     f"complements instead of {wc['terms']} expanded terms; the geometry is the same.")
     return notes
 
 
