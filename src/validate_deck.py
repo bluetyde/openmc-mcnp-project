@@ -531,14 +531,15 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
                 if (ch, op) not in seen:
                     seen.add((ch, op))
                     uniq.append((label, ch, op))
-            g = check_geometry(problem, model.geometry, n_samples=geometry_samples, chains=uniq or None)
+            g = check_geometry(problem, model.geometry, n_samples=geometry_samples, chains=uniq or None, model=model)
             if g["reason"]:
                 errors.append(f"Geometry check could not run: {g['reason']}.")
             elif not g["ok"]:
                 errors.extend(f"Geometry: {e}" for e in g["errors"])
             else:
                 passed.append(f"geometry matches OpenMC at {g['checked_points']} sampled points "
-                              f"({g['skipped_near_surface']} on-surface points skipped), materials and densities match")
+                              f"({g['skipped_near_surface']} on-surface points skipped), materials and densities match"
+                              + ("" if g["find"] == "openmc.lib" or uniq else f" [OpenMC cells found in Python: {g['find']}]"))
                 if uniq:
                     passed.append(f"{len(uniq) - len(g['unhit_chains'])} of {len(uniq)} lattice tally bins hold the same "
                                   f"points as their OpenMC cell instances")

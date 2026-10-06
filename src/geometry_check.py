@@ -30,7 +30,13 @@ LAT=1 rectangular boxes, or LAT=2 hexagonal prisms along z whose faces are liste
 (p. 290); a LAT=2 point is placed in the nearest hexagon. Decks with other surface types, surface
 transformations, TRCL or rotated fills are reported as not checkable rather than silently passed.
 """
+import json
 import math
+import os
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 
 import numpy as np
@@ -575,15 +581,80 @@ def chain_text(chain):
     return levels[0] if len(levels) == 1 else "(" + " < ".join(levels) + ")"
 
 
-def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345, chains=None):
+# Runs in its own process: openmc.lib aborts the whole interpreter when it can't load the model (for example
+# when the nuclear data library is missing), and that must not take the caller down with it.
+LIB_FIND = r'''
+import json, os, sys, tempfile, xml.etree.ElementTree as ET
+import numpy as np
+import openmc.lib
+from openmc.exceptions import GeometryError
+model_xml, pts_file, out = sys.argv[1:4]
+root = ET.parse(model_xml).getroot()
+for tag in ("settings", "tallies", "plots"):
+    for el in root.findall(tag):
+        root.remove(el)
+root.append(ET.fromstring("<settings><run_mode>fixed source</run_mode><particles>10</particles><batches>1</batches>"
+                          "<source><space type='point' parameters='0 0 0'/></source></settings>"))
+surfs = root.findall("./geometry/surface")
+if surfs and not any(s.get("boundary", "transmission") != "transmission" for s in surfs):
+    surfs[0].set("boundary", "vacuum")  # a boundary type doesn't change which cell holds a point
+os.chdir(tempfile.mkdtemp())
+ET.ElementTree(root).write("model.xml")
+openmc.lib.init(output=False)
+ids = []
+for p in np.load(pts_file):
+    try:
+        cell, _instance = openmc.lib.find_cell(tuple(float(v) for v in p))
+    except GeometryError:  # the point is outside the model
+        ids.append(-1)
+        continue
+    ids.append(int(cell.id))
+openmc.lib.finalize()
+json.dump(ids, open(out, "w"))
+'''
+
+
+def lib_cell_ids(model, P, timeout=1800):
+    """(ids, None): the id of the OpenMC cell holding each point of P, found by OpenMC's C++ geometry (-1 where the
+    point is outside the model); the deepest cell, which is what Geometry.find()'s last item is.
+    (None, reason) when OpenMC can't be started on the model; the caller then uses the Python find."""
+    work = tempfile.mkdtemp(prefix="geomcheck-")
+    model_xml = os.path.join(work, "model.xml")
+    try:
+        model.export_to_model_xml(model_xml)
+        np.save(os.path.join(work, "pts.npy"), np.asarray(P, dtype=float))
+        script = os.path.join(work, "find.py")
+        with open(script, "w") as f:
+            f.write(LIB_FIND)
+        out = os.path.join(work, "out.json")
+        r = subprocess.run([sys.executable, script, model_xml, os.path.join(work, "pts.npy"), out],
+                           capture_output=True, text=True, timeout=timeout, cwd=work)
+        if r.returncode:
+            return None, "openmc.lib could not load the model: " + (r.stdout + r.stderr).strip()[-300:]
+        with open(out) as f:
+            ids = np.array(json.load(f), dtype=np.int64)
+    except subprocess.TimeoutExpired:
+        return None, f"openmc.lib took more than {timeout} s"
+    except (OSError, ValueError) as e:
+        return None, f"openmc.lib result could not be read ({type(e).__name__}: {e})"
+    if len(ids) != len(P):
+        return None, f"openmc.lib answered {len(ids)} of {len(P)} points"
+    return ids, None
+
+
+def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345, chains=None, model=None):
     """Return dict(ok, checked_points, errors, skipped_near_surface, reason, unhit_chains, unsampled_cells).
+
+    With `model` (the openmc.Model the geometry belongs to) and no lattice-bin `chains`, the OpenMC cell of every
+    point comes from OpenMC's C++ geometry in a subprocess (about 1000 times faster than Geometry.find on a few
+    hundred cells); result["find"] says which was used, and why when it fell back to the Python find.
 
     unsampled_cells lists the material/void cells no sample point landed in. Their geometry was NOT
     compared: OpenMC can't bound a region made of tilted planes or quadrics, so such a cell's "box" is
     the whole domain, and a small cell in a large world can get no points at all. A pass with
     unsampled cells is a pass for the rest of the model only, and callers must say so."""
     result = {"ok": False, "checked_points": 0, "errors": [], "skipped_near_surface": 0, "reason": None,
-              "unhit_chains": [], "unsampled_cells": []}
+              "unhit_chains": [], "unsampled_cells": [], "find": "python"}
     try:
         deck = _Deck(problem)
     except NotCheckable as e:
@@ -623,10 +694,19 @@ def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345,
         if len(errors) < 20:
             errors.append(msg)
 
+    lib_ids = None
+    all_cells = geometry.get_all_cells()
+    if model is not None and not chains:
+        lib_ids, why = lib_cell_ids(model, P)
+        result["find"] = "openmc.lib" if lib_ids is not None else f"python ({why})"
     cell_hits = {}
     for pi, (p, n) in enumerate(zip(P, leaf)):
-        found = geometry.find(tuple(p))
-        omc_cell = found[-1] if found and isinstance(found[-1], openmc.Cell) else None
+        if lib_ids is not None:
+            found = None
+            omc_cell = all_cells[int(lib_ids[pi])] if lib_ids[pi] >= 0 else None
+        else:
+            found = geometry.find(tuple(p))
+            omc_cell = found[-1] if found and isinstance(found[-1], openmc.Cell) else None
         if omc_cell is not None:
             cell_hits[omc_cell.id] = cell_hits.get(omc_cell.id, 0) + 1
         where = f"({p[0]:.4g}, {p[1]:.4g}, {p[2]:.4g})"
