@@ -539,7 +539,7 @@ def validate_deck(deck_path, materials_path="materials.xml", model=None, geometr
             else:
                 passed.append(f"geometry matches OpenMC at {g['checked_points']} sampled points "
                               f"({g['skipped_near_surface']} on-surface points skipped), materials and densities match"
-                              + ("" if g["find"] == "openmc.lib" or uniq else f" [OpenMC cells found in Python: {g['find']}]"))
+                              + (f" [OpenMC cells found in Python: {g['find']}]" if g["find"].startswith("python (") else ""))
                 if uniq:
                     passed.append(f"{len(uniq) - len(g['unhit_chains'])} of {len(uniq)} lattice tally bins hold the same "
                                   f"points as their OpenMC cell instances")

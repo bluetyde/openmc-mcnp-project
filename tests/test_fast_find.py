@@ -91,7 +91,7 @@ class FastFind(unittest.TestCase):
         for with_box in (False, True):
             model, problem = self.coverage_model(with_box)
             slow = check_geometry(problem, model.geometry)
-            fast = check_geometry(problem, model.geometry, model=model)
+            fast = check_geometry(problem, model.geometry, model=model, fast_find=True)
             self.assertEqual(slow["find"], "python")
             self.assertEqual(fast["find"], "openmc.lib")
             for key in ("ok", "checked_points", "errors", "skipped_near_surface", "unsampled_cells", "cell_hits"):
@@ -104,7 +104,7 @@ class FastFind(unittest.TestCase):
         os.environ["OPENMC_CROSS_SECTIONS"] = os.path.join(tempfile.gettempdir(), "no-such-library", "cross_sections.xml")
         try:
             ids, why = lib_cell_ids(model, np.zeros((3, 3)))
-            fast = check_geometry(problem, model.geometry, model=model)
+            fast = check_geometry(problem, model.geometry, model=model, fast_find=True)
         finally:
             if old is None:
                 del os.environ["OPENMC_CROSS_SECTIONS"]
@@ -115,6 +115,18 @@ class FastFind(unittest.TestCase):
         self.assertTrue(fast["find"].startswith("python (openmc.lib could not load the model"), fast["find"])
         self.assertTrue(fast["ok"], fast["errors"])  # the Python find still ran the whole check
 
+    def test_auto_uses_the_fast_path_only_when_it_pays(self):
+        model, problem = self.coverage_model(True)  # 2 cells x about 25,000 points: below the threshold
+        self.assertEqual(check_geometry(problem, model.geometry, model=model)["find"], "python")
+        self.assertEqual(check_geometry(problem, model.geometry, model=model, fast_find=False)["find"], "python")
+        old = geometry_check.LIB_FIND_MIN_WORK
+        geometry_check.LIB_FIND_MIN_WORK = 1000  # the same model is now "big enough"
+        try:
+            self.assertEqual(check_geometry(problem, model.geometry, model=model)["find"], "openmc.lib")
+        finally:
+            geometry_check.LIB_FIND_MIN_WORK = old
+        self.assertEqual(check_geometry(problem, model.geometry)["find"], "python")  # no model: nothing to start
+
     def test_wrong_cell_ids_from_the_fast_path_are_reported(self):
         model, problem = self.coverage_model(True)
         real = geometry_check.lib_cell_ids
@@ -124,7 +136,7 @@ class FastFind(unittest.TestCase):
             return np.where(ids == 1, 2, np.where(ids == 2, 1, ids)), why
         geometry_check.lib_cell_ids = swapped
         try:
-            g = check_geometry(problem, model.geometry, model=model)
+            g = check_geometry(problem, model.geometry, model=model, fast_find=True)
         finally:
             geometry_check.lib_cell_ids = real
         self.assertEqual(g["find"], "openmc.lib")

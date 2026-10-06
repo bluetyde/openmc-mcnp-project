@@ -44,6 +44,10 @@ import openmc
 from montepy.surfaces.half_space import HalfSpace, UnitHalfSpace
 from montepy.surfaces.half_space import Operator
 
+# Starting OpenMC in a subprocess costs about 5 s; Geometry.find costs about 0.1 ms per cell per point
+# (30 ms a point on 267 cells). The fast path pays off above roughly this many points x cells.
+LIB_FIND_MIN_WORK = 60000
+
 SURFACE_TOL = 1e-6  # cm; points closer than this to any surface are skipped (on-surface ambiguity)
 LOST, OVERLAP, NEAR = -1, -2, -3
 
@@ -642,12 +646,14 @@ def lib_cell_ids(model, P, timeout=1800):
     return ids, None
 
 
-def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345, chains=None, model=None):
+def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345, chains=None, model=None, fast_find="auto"):
     """Return dict(ok, checked_points, errors, skipped_near_surface, reason, unhit_chains, unsampled_cells).
 
     With `model` (the openmc.Model the geometry belongs to) and no lattice-bin `chains`, the OpenMC cell of every
     point comes from OpenMC's C++ geometry in a subprocess (about 1000 times faster than Geometry.find on a few
-    hundred cells); result["find"] says which was used, and why when it fell back to the Python find.
+    hundred cells); result["find"] is "openmc.lib", "python" (not used: small model, lattice chains, no model, or
+    fast_find=False), or "python (reason)" when OpenMC could not be started. fast_find="auto" uses it only when
+    points x cells is over LIB_FIND_MIN_WORK, so small models don't pay for starting OpenMC; True forces it.
 
     unsampled_cells lists the material/void cells no sample point landed in. Their geometry was NOT
     compared: OpenMC can't bound a region made of tilted planes or quadrics, so such a cell's "box" is
@@ -696,7 +702,8 @@ def check_geometry(problem, geometry, n_samples=20000, per_cell=500, seed=12345,
 
     lib_ids = None
     all_cells = geometry.get_all_cells()
-    if model is not None and not chains:
+    if model is not None and not chains and fast_find is not False and \
+            (fast_find is True or len(P) * len(all_cells) > LIB_FIND_MIN_WORK):
         lib_ids, why = lib_cell_ids(model, P)
         result["find"] = "openmc.lib" if lib_ids is not None else f"python ({why})"
     cell_hits = {}
