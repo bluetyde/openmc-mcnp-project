@@ -1,7 +1,7 @@
 """Plain cells get their regions written directly; MCNPy translates a short placeholder instead.
 
-MCNPy's cost is a Java round trip per region term, and its "Making Universes" phase was 292 s of 311 on the 267-cell
-graphite-pile import. cell_regions gives every cell that is only a material (or void) and half-spaces a placeholder of
+MCNPy's cost is a Java round trip per region term, and its cell-adding stage ("Translating Universes and Cells")
+was 292 s of 311 on the 267-cell graphite-pile import. cell_regions gives every cell that is only a material (or void) and half-spaces a placeholder of
 about one term while MCNPy translates, then writes the real region into the card. These tests check the region text
 (operator precedence), which cells are touched, that the placeholders still make MCNPy write every surface, the card
 patching and its refusals, and (needs the MCNPy gateway, port 25333: claim it where agents share a machine) that a

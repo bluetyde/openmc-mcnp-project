@@ -1,8 +1,8 @@
 """Write the regions of plain cells directly, so MCNPy only has to translate what it alone can.
 
 MCNPy takes a round trip to its Java process for every term of every region (about 300 per term; the 267-cell
-graphite-pile import costs 2.0 million of them after world_complement; its "Making Universes" phase is 292 of the
-311 s). A cell that is only a material (or void) and a region of half-spaces needs none of that: its region is
+graphite-pile import costs 2.0 million of them after world_complement; its cell-adding stage
+("Translating Universes and Cells") is 292 of the 311 s). A cell that is only a material (or void) and a region of half-spaces needs none of that: its region is
 -7 8 (-9:10) in MCNP, one token per half-space with the surface's own number (MCNPy keeps OpenMC's ids). So while
 MCNPy translates, each such cell gets a short placeholder region, and the card text is patched afterwards: each
 placeholder is replaced by the real region. MCNPy still writes the surface cards (boundary flags, every surface

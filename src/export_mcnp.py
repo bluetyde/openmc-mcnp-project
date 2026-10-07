@@ -40,6 +40,8 @@ def translate(model, out_path, stdout=None):
         raise RuntimeError("MCNPy is not importable in this environment. See CLAUDE.md 'MCNPy install notes'. "
                            f"Original error: {e}")
     notes = lattice_cards.prepare(model)
+    import mcnpy_speed  # after the MCNPy import above: it needs py4j
+    speed = {}
     wc = world_complement.plan(model.geometry)  # the rest-of-the-world cell, written as #cell complements below
     cr = cell_regions.plan(model.geometry, skip={wc["cell"].id} if wc else (),
                            extra_seen=[h.surface.id for h in cell_regions._literals(wc["kept"])] if wc else ())
@@ -47,7 +49,8 @@ def translate(model, out_path, stdout=None):
     def run(cr):
         with contextlib.redirect_stdout(stdout if stdout is not None else io.StringIO()), \
                 lattice_cards.mcnpy_view(model), world_complement.mcnpy_view(wc), \
-                cell_regions.mcnpy_view(cr):
+                cell_regions.mcnpy_view(cr), mcnpy_speed.mcnpy_speedups() as status:
+            speed.update(status)
             deck = openmc_to_mcnp(model.geometry, model.materials, model.settings)
             deck.write(out_path)
         if wc:
@@ -61,6 +64,9 @@ def translate(model, out_path, stdout=None):
         notes.append(f"The regions of plain cells were not written directly ({e}); MCNPy translated them.")
         cr = None
         run(None)
+    off = {k: v for k, v in speed.items() if v != "on"}
+    if off:
+        notes.append("MCNPy speedups left off: " + "; ".join(f"{k} {v}" for k, v in off.items()) + ".")
     if wc:
         notes.append(f"Cell {wc['cell'].id} (outside the other cells) is written with {len(wc['ids'])} #cell "
                      f"complements instead of {wc['terms']} expanded terms; the geometry is the same.")
