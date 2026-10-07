@@ -23,6 +23,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import lattice_cards  # noqa: E402
+import cell_regions  # noqa: E402
 import world_complement  # noqa: E402
 from mcnp_cards import UnsupportedFeature  # noqa: E402
 from remediate_deck import load_model, remediate  # noqa: E402
@@ -40,14 +41,32 @@ def translate(model, out_path, stdout=None):
                            f"Original error: {e}")
     notes = lattice_cards.prepare(model)
     wc = world_complement.plan(model.geometry)  # the rest-of-the-world cell, written as #cell complements below
-    with contextlib.redirect_stdout(stdout if stdout is not None else io.StringIO()), \
-            lattice_cards.mcnpy_view(model), world_complement.mcnpy_view(wc):
-        deck = openmc_to_mcnp(model.geometry, model.materials, model.settings)
-        deck.write(out_path)
+    cr = cell_regions.plan(model.geometry, skip={wc["cell"].id} if wc else (),
+                           extra_seen=[h.surface.id for h in cell_regions._literals(wc["kept"])] if wc else ())
+
+    def run(cr):
+        with contextlib.redirect_stdout(stdout if stdout is not None else io.StringIO()), \
+                lattice_cards.mcnpy_view(model), world_complement.mcnpy_view(wc), \
+                cell_regions.mcnpy_view(cr):
+            deck = openmc_to_mcnp(model.geometry, model.materials, model.settings)
+            deck.write(out_path)
+        if wc:
+            world_complement.patch_file(out_path, wc)
+        if cr:
+            cell_regions.patch_file(out_path, cr)
+
+    try:
+        run(cr)
+    except cell_regions.DirectCardsMismatch as e:
+        notes.append(f"The regions of plain cells were not written directly ({e}); MCNPy translated them.")
+        cr = None
+        run(None)
     if wc:
-        world_complement.patch_file(out_path, wc)
         notes.append(f"Cell {wc['cell'].id} (outside the other cells) is written with {len(wc['ids'])} #cell "
                      f"complements instead of {wc['terms']} expanded terms; the geometry is the same.")
+    if cr:
+        notes.append(f"The regions of {len(cr['texts'])} plain cells are written directly (MCNPy translated one term "
+                     f"each); the geometry is the same.")
     return notes
 
 
