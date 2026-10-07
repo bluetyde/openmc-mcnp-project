@@ -112,7 +112,7 @@ the installed version instead.
   - `openmc_to_mcnp()` tags all cells with `U 1` without creating a Universe 0 container cell, causing MCNP to fail (`no cells in universe 0`).
   - `openmc_to_mcnp()` drops vacuum boundary conditions. MCNP has no vacuum surface type, and no outside cell with `IMP:N=0` is created, so every particle leaving the model would be lost. `remediate_deck.py` adds a graveyard cell (`#` complement of every root-universe cell).
   - `openmc_to_mcnp()` translates no tallies or sources (MCNPy has tally/source classes, but the OpenMC translator never uses them).
-  - `openmc_to_mcnp()` gets lattices wrong. It moves the unit universe's cells with TRCL, writes an element box that isn't centred on them, and picks index ranges that don't cover the lattice. For the NE403 graphite pile, every aperture ended up outside its element. `src/lattice_cards.py` rewrites the cards from the OpenMC `RectLattice`:
+  - `openmc_to_mcnp()` gets lattices wrong. It moves the unit universe's cells with TRCL, writes an element box that isn't centred on them, and picks index ranges that don't cover the lattice. For a lattice lab deck (square apertures in a block), every aperture ended up outside its element. `src/lattice_cards.py` rewrites the cards from the OpenMC `RectLattice`:
     - element [0,0,0] is PX/PY/PZ planes around the origin, in the order +x, -x, +y, -y, +z, -z (MCNP 6.3 manual p. 290);
     - `FILL=u`, or an array with i varying fastest (p. 291-292); OpenMC lists rows top first, so y is flipped;
     - `FILL=L (x0 y0 z0)` on the filled cell;

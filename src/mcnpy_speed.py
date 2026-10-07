@@ -7,7 +7,7 @@ ask the same questions again and again:
    557 and 558 for root cells). The property walks every cell added so far and reads `cell.universe` from
    Java each time (deck.py:228), 11 round trips per read (metapy/wrap.py:448, 216-217: eGet, the five-step
    lookup of org.eclipse.emf.ecore.EAttribute, and the five-step is_instance_of). Adding N cells costs
-   11 N^2 trips: 784,000 for the 267-cell graphite pile. The walk only moves cells whose universe was
+   11 N^2 trips: 784,000 for a 267-cell lattice lab deck. The walk only moves cells whose universe was
    changed after they were added; inside openmc_to_mcnp no cell has a universe until "Making Universes",
    after the last add, so every walk done by an add changes nothing. fast_add() gives get_universe the
    stored dict instead of the property; the later reads of deck.universes (fills, lattices) still walk.
