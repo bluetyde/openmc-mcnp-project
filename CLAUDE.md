@@ -145,7 +145,7 @@ the installed version instead.
   - Surfaces: P (4-constant), PX/PY/PZ, SO/S/SX/SY/SZ, CX/CY/CZ, C/X/C/Y/C/Z and GQ.
   - Universes: it follows FILL (with a translation), LAT=1 lattices with rectangular elements, and LAT=2 lattices whose 8 faces are in the manual's order. A LAT=2 point goes to the nearest hexagon centre.
   - TRCL, rotated fills and surface transformations are reported as "could not run", never silently passed.
-  - Its lattice rules come from the MCNP 6.3 manual. The writer (`lattice_cards.py`) follows the same reading of it, so the final proof is an MCNP plot or run of a lattice deck (not done yet: no MCNP here).
+  - Its lattice rules come from the MCNP 6.3 manual. The writer (`lattice_cards.py`) follows the same reading of it. Whether a lattice deck has been plotted or run in MCNP is not something this project states (see the MCNP sentence in the README).
 - MCNPy's Java bridge (metapy/py4j) always uses port 25333, and there is only one per machine.
   - A second process that imports `mcnpy` attaches to the running bridge instead of starting its own.
   - When the process that started the bridge exits, `atexit` kills it, and the others fail with `ConnectionRefusedError ... 25333`.
@@ -153,7 +153,7 @@ the installed version instead.
   - Don't use `metapy/java_cleanup.sh`: it kills the most recently started Java process on the machine.
   - If Java dies on launch (seen after a cold WSL boot), metapy waits forever. Its loop only stops when `sleep_time == 5.0`, and 0.01 s float steps never hit that exactly. OpenMC Studio's server gives up after 180 s; scripts need their own timeout. You can also start `java -jar <metapy>/EntryPoint.jar` yourself first: metapy attaches to it, and you see Java's errors.
 - OpenMC 0.15.3's `Model.from_model_xml()` drops the axial level of a `HexLattice` with `n_axial="1"`. Python's `geometry.find()` then treats it as 2D, but OpenMC's transport code (checked with `openmc.lib.find_cell`) keeps it 3D. `load_model()` repairs this (`lattice_cards.fix_loaded_hex_lattices`), so the geometry check compares against what OpenMC actually runs.
-- No MCNP executable is installed in this environment, so exported decks are validated by MontePy, `validate_deck.py` and the geometry check, but have not been run through MCNP itself.
+- Exported decks are validated by MontePy, `validate_deck.py` and the geometry check, and compared with OpenMC. This project makes no statement about whether any deck has been run in MCNP, and MCNP output is not shared here (MCNP is export-controlled): do not write either claim in any file.
 - MontePy: `problem.mode` is not included in `write_to_file()` output by
   itself — `_write_to_stream()` only walks `cells`/`surfaces`/`data_inputs`,
   not `mode` directly. To get a `MODE` card written out, explicitly
