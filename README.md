@@ -44,7 +44,9 @@ Anything that can't be translated faithfully is refused with a reason instead of
 No MCNP executable is needed for any of this.
 
 **Status**: every feature above is checked against OpenMC this way, and `tests/check_export_mcnp.py` also
-confirms each validator check can fail. The decks have not yet been run in MCNP itself.
+confirms each validator check can fail. This project makes no statement about whether any exported deck has been run in MCNP. MCNP is export-controlled and its
+output is not shared here. Decks are checked by this validator (MontePy parse, cards read back against the OpenMC model, sampled geometry comparison) and compared
+with OpenMC. Check a deck yourself before relying on it. Experimental and educational: not validated for safety, licensing or operation.
 
 ## Install
 
@@ -91,9 +93,16 @@ python tests/test_deck_format.py         # 128-column wrapping
 python tests/test_studio_ids.py          # Studio ID comments survive a round trip
 python tests/test_column_export.py       # a real translation stays within 128 columns (needs MCNPy)
 python tests/test_dose_export.py         # dose cards: DE/DF numbers, SD volume, rate factor, photon F4:P (needs MCNPy)
+python tests/test_review_semantics.py    # what the cards mean: histogram sources, photon current tallies, tally energy edges
+python tests/test_fast_find.py           # the geometry check's fast cell lookup equals the Python one (needs OPENMC_CROSS_SECTIONS)
+python tests/test_mcnpy_speed.py         # the MCNPy speedups change only the number of round trips (no Java gateway)
+python tests/test_mcnpy_speed_identity.py  # the same model translates byte for byte the same with the speedups on and off (needs MCNPy)
+python tests/test_cell_regions.py        # plain cells get their regions written directly (needs MCNPy)
+python tests/test_world_complement.py    # the rest-of-the-world cell is written as #cell complements (needs MCNPy)
+python tests/test_void_model.py          # a model with no materials exports (needs MCNPy)
 ```
 
-MCNPy's Java bridge listens on a fixed port (25333), so run one export at a time on a machine.
+The tests marked "needs MCNPy" start MCNPy's Java bridge, which listens on a fixed port (25333), so run one at a time on a machine.
 
 ## Layout
 
