@@ -68,3 +68,25 @@ def format_deck(text):
             chunks.append(current + (" &" if continued else ""))
         out.extend(chunks)
     return "\n".join(out) + ("\n" if text.endswith(("\n", "\r")) else "")
+
+
+UNIVERSE_WORD = re.compile(r"(?<![\w:=.+-])([uU])[ \t]+(-?\d+)(?=[ \t&]|$)")
+
+
+def universe_keyword_equals(text):
+    """Write `U n` as `U=n` on the cell cards (the first block after the title).
+
+    MCNPy writes the bare form. The manual's cell-card parameter is `U = n` and its examples write `u=1` (MCNP 6.3.0,
+    section 5.2); that the equals sign is optional is stated for data-card keywords (p. 275, 308, 379), not for cell
+    cards, and other readers of decks drop `U 1` without a word. Title, comment cards, `$` comments and every block after
+    the cells are left alone.
+    """
+    head, sep, rest = text.partition("\n\n")
+    out = []
+    for number, line in enumerate(head.split("\n")):
+        if number == 0 or re.match(r"^ {0,4}[cC](?:\s|$)", line) or line.lstrip().startswith("$"):
+            out.append(line)
+            continue
+        code, dollar, comment = line.partition("$")
+        out.append(UNIVERSE_WORD.sub(lambda m: f"{m.group(1)}={m.group(2)}", code) + dollar + comment)
+    return "\n".join(out) + sep + rest

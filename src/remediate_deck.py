@@ -30,7 +30,7 @@ import lattice_cards
 import macrobody_cards
 import mcnp_cards
 from mcnp_cards import UnsupportedFeature
-from deck_format import format_deck
+from deck_format import format_deck, universe_keyword_equals
 
 
 ASCII_SUBS = {"\u00d7": "x", "\u00b0": " deg", "\u00b5": "u", "\u03bc": "u", "\u2013": "-", "\u2014": "-",
@@ -198,6 +198,7 @@ def remediate(source_deck, model, out_deck, sab_map=None, detector_responses=Non
             deck_text = f.read()
         if t_cards:
             deck_text = deck_text.rstrip("\n") + "\n" + "\n".join(t_cards) + "\n"
+        deck_text = universe_keyword_equals(deck_text)
         deck_text = decorate_deck(deck_text, model, graveyard_id=graveyard)
         if studio_ids is not None:
             from studio_ids import annotate

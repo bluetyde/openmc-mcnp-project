@@ -4,7 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
-from deck_format import format_deck, overlong_lines
+from deck_format import format_deck, overlong_lines, universe_keyword_equals
 
 
 class DeckFormatting(unittest.TestCase):
@@ -48,6 +48,36 @@ class DeckFormatting(unittest.TestCase):
             format_deck('title\nSI1 ' + '1' * 130)
         with self.assertRaisesRegex(ValueError, 'quoted'):
             format_deck('title\nFILE="' + 'long name ' * 20 + '"')
+
+    def test_universe_keyword_gets_an_equals_sign_on_cell_cards_only(self):
+        text = ('U 5 is the title\n'
+                '1 1 -1.0 -1 2 U 1 IMP:N=1.0\n'
+                'c a comment with U 2 in it\n'
+                '2 0 3 -4 U -3 $ note: U 4\n'
+                '3 0 5 FILL=1 (1 0 0) u 7\n'
+                '     LAT=1 U 8 &\n'
+                '     IMP:N=1\n'
+                '4 0 -6 U 1.5 IMP:N=1\n'
+                '\n'
+                '1 SO 5\n'
+                '\n'
+                'SDEF POS=0 0 0\n'
+                'U 9\n')
+        want = ('U 5 is the title\n'
+                '1 1 -1.0 -1 2 U=1 IMP:N=1.0\n'
+                'c a comment with U 2 in it\n'
+                '2 0 3 -4 U=-3 $ note: U 4\n'
+                '3 0 5 FILL=1 (1 0 0) u=7\n'
+                '     LAT=1 U=8 &\n'
+                '     IMP:N=1\n'
+                '4 0 -6 U 1.5 IMP:N=1\n'
+                '\n'
+                '1 SO 5\n'
+                '\n'
+                'SDEF POS=0 0 0\n'
+                'U 9\n')
+        self.assertEqual(universe_keyword_equals(text), want)
+        self.assertEqual(universe_keyword_equals(want), want)  # nothing left to change: idempotent
 
 
 if __name__ == '__main__':

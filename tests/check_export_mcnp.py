@@ -596,9 +596,9 @@ def main():
         lat_mutate("lattice: FILL array transposed", with_card(card.replace(fm.group(1), " ".join(transposed) + " ", 1)),
                    r"Geometry:")
         # 4. a TRCL put back on a unit-universe cell: the check must say it can't check, not pass
-        ui = next(i for i, l in enumerate(lines3) if re.match(r"^\d+ \d+ -?[0-9.]+ .*\bU \d+", l))
+        ui = next(i for i, l in enumerate(lines3) if re.match(r"^\d+ \d+ -?[0-9.]+ .*\bU=\d+", l))
         with_trcl = lines3[:]
-        with_trcl[ui] = re.sub(r"(\bU \d+)", r"\1 TRCL (0 0 1)", with_trcl[ui], count=1)
+        with_trcl[ui] = re.sub(r"(\bU=\d+)", r"\1 TRCL (0 0 1)", with_trcl[ui], count=1)
         lat_mutate("lattice: TRCL on a unit cell", "\n".join(with_trcl), r"TRCL")
 
 
