@@ -3,7 +3,7 @@ openmc
 numpy
 
 # Iteration phase (pip-installable)
-montepy
+montepy==1.1.3
 
 # MCNPy is NOT listed here — it isn't on PyPI and needs Java 8 + MetaPy.
 # See CLAUDE.md "MCNPy install notes" before running src/translate_to_mcnp.py.
