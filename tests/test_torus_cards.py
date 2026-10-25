@@ -51,6 +51,12 @@ class Pure(unittest.TestCase):
             self.assertEqual(tp[0]["card"], card)
             self.assertEqual(tp[0]["values"], [1.0, -2.0, 3.0, 10.0, 4.0, 3.0])
 
+    def test_a_zero_or_negative_radius_is_refused(self):
+        for a, b, c in ((10.0, 0.0, 3.0), (10.0, -4.0, 3.0), (10.0, 4.0, 0.0), (10.0, 4.0, -3.0), (0.0, 4.0, 3.0), (-10.0, 4.0, 3.0)):
+            with self.assertRaises(ValueError, msg=(a, b, c)):       # OpenMC itself may already refuse some of these; either way no deck is written
+                model, _ = torus_model(a=a, b=b, c=c)
+                torus_cards.plan(model.geometry)
+
     def test_no_torus_no_plan(self):
         openmc.reset_auto_ids()
         s = openmc.Sphere(r=3, boundary_type="vacuum")
@@ -79,7 +85,7 @@ class Pure(unittest.TestCase):
         model, (t,) = torus_model(openmc.YTorus, centre=(1.0, 2.0, 3.0))
         tp = torus_cards.plan(model.geometry)
         r = tp[0]["radius"]
-        deck = f"c cells\n1 1 -7.87 -{t.id}\n\n{t.id} S 1.0 2.0 3.0 {r}\n99 S 1.0 2.0 3.0 {r + 5}\n98 SO {r}\n\nMODE N\n"
+        deck = f"c cells\n1 1 -7.87 -{t.id}\n\n98 SO {r}\n99 S 1.0 2.0 3.0 {r + 5}\n{t.id} S 1.0 2.0 3.0 {r}\n\nMODE N\n"   # the decoy with the same radius comes first
         out = torus_cards.patch_deck(deck, tp)
         self.assertIn(f"{t.id} TY 1.0 2.0 3.0 10.0 4.0 3.0", out)
         self.assertIn(f"99 S 1.0 2.0 3.0 {r + 5}", out)
