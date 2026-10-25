@@ -100,6 +100,20 @@ def _surface_fn(s):
             gz = 2 * C * z + E * y + F * x + J
             return v, np.sqrt(gx * gx + gy * gy + gz * gz)  # |v| / |grad| ~ distance to the surface
         return gq
+    if t in ("TX", "TY", "TZ") and len(c) == 6:
+        # MCNP 6.3 section 5.3, equation 5.1: s^2 / B^2 + (rho - A)^2 / C^2 = 1, s along the torus axis (B), rho across it (A the major radius, C the half-width across).
+        ctr = np.array(c[:3], dtype=float)
+        A, B, C = c[3], c[4], c[5]
+        axis = "XYZ".index(t[1])
+        o1, o2 = [i for i in range(3) if i != axis]
+
+        def torus(P):
+            s_ = P[:, axis] - ctr[axis]
+            rho = np.sqrt((P[:, o1] - ctr[o1]) ** 2 + (P[:, o2] - ctr[o2]) ** 2)
+            v = s_ * s_ / (B * B) + (rho - A) ** 2 / (C * C) - 1.0
+            grad = 2.0 * np.sqrt((s_ / (B * B)) ** 2 + ((rho - A) / (C * C)) ** 2)
+            return v, np.maximum(grad, 1e-12)  # |v| / |grad| ~ distance to the surface
+        return torus
     if t == "RPP" and len(c) == 6:
         x0, x1, y0, y1, z0, z1 = c
 

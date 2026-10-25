@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import lattice_cards  # noqa: E402
 import cell_regions  # noqa: E402
+import torus_cards  # noqa: E402
 import world_complement  # noqa: E402
 from mcnp_cards import UnsupportedFeature  # noqa: E402
 from remediate_deck import load_model, remediate  # noqa: E402
@@ -43,16 +44,19 @@ def translate(model, out_path, stdout=None):
     import mcnpy_speed  # after the MCNPy import above: it needs py4j
     speed = {}
     wc = world_complement.plan(model.geometry)  # the rest-of-the-world cell, written as #cell complements below
+    tp = torus_cards.plan(model.geometry)       # tori: MCNPy has none, so it gets a stand-in sphere and the card is rewritten to TX/TY/TZ below
     cr = cell_regions.plan(model.geometry, skip={wc["cell"].id} if wc else (),
                            extra_seen=[h.surface.id for h in cell_regions._literals(wc["kept"])] if wc else ())
 
     def run(cr):
         with contextlib.redirect_stdout(stdout if stdout is not None else io.StringIO()), \
-                lattice_cards.mcnpy_view(model), world_complement.mcnpy_view(wc), \
+                lattice_cards.mcnpy_view(model), world_complement.mcnpy_view(wc), torus_cards.mcnpy_view(tp, model.geometry), \
                 cell_regions.mcnpy_view(cr), mcnpy_speed.mcnpy_speedups() as status:
             speed.update(status)
             deck = openmc_to_mcnp(model.geometry, model.materials, model.settings)
             deck.write(out_path)
+        if tp:
+            torus_cards.patch_file(out_path, tp)
         if wc:
             world_complement.patch_file(out_path, wc)
         if cr:
@@ -64,6 +68,9 @@ def translate(model, out_path, stdout=None):
         notes.append(f"The regions of plain cells were not written directly ({e}); MCNPy translated them.")
         cr = None
         run(None)
+    if tp:
+        notes.append(f"{len(tp)} torus surface{'s' if len(tp) != 1 else ''} written as MCNP " + "/".join(sorted({t['card'] for t in tp})) +
+                     " cards (surface number{} {}).".format('s' if len(tp) != 1 else '', ", ".join(str(t['id']) for t in tp)))
     off = {k: v for k, v in speed.items() if v != "on"}
     if off:
         notes.append("MCNPy speedups left off: " + "; ".join(f"{k} {v}" for k, v in off.items()) + ".")
